@@ -1,3 +1,5 @@
+#pragma once
+
 //+--------------------------------------------------------------------------
 //
 // File:        PatternLife.h
@@ -131,8 +133,8 @@ constexpr auto CRC_LENGTH = (std::max(MATRIX_HEIGHT, MATRIX_WIDTH) * 4 + 1);
 class PatternLife : public EffectWithId<PatternLife>
 {
 private:
-    std::unique_ptr<Cell [][MATRIX_HEIGHT]> world;
-    std::unique_ptr<uint32_t []> checksums;
+    allocated_unique_ptr<Cell [][MATRIX_HEIGHT]> world;
+    allocated_unique_ptr<uint32_t []> checksums;
     int iChecksum = 0;
     uint32_t bStuckInLoop = 0;
     unsigned int density = 50;
@@ -257,9 +259,9 @@ public:
         for (int i = 0; i < MATRIX_WIDTH; i++) {
             for (int j = 0; j < MATRIX_HEIGHT; j++) {
                 if (world[i][j].brightness > 0)
-                    g()->leds[XY(i, j)] += g()->ColorFromCurrentPalette(world[i][j].hue * 4, world[i][j].brightness);
+                    g().leds[XY(i, j)] += g().ColorFromCurrentPalette(world[i][j].hue * 4, world[i][j].brightness);
                 else
-                    g()->leds[XY(i, j)] = CRGB::Black;
+                    g().leds[XY(i, j)] = CRGB::Black;
             }
         }
 
@@ -268,12 +270,17 @@ public:
         // We have to first extract the alive bits alone because we don't want the hue and brightness
         // data to mess with the CRC.
 
-        bool alive[MATRIX_WIDTH][MATRIX_HEIGHT];
-        for (int i = 0; i < MATRIX_WIDTH; i++)
-            for (int j = 0; j < MATRIX_HEIGHT; j++)
-                alive[i][j] = world[i][j].alive;
-
-        auto crc = uzlib_crc32(alive, sizeof(alive), 0xffffffff);
+        // Feed the CRC one short row at a time. A full MATRIX_WIDTH by
+        // MATRIX_HEIGHT temporary here overflowed the renderer task stack on
+        // larger matrices (14.4 KB at 160x90).
+        std::array<uint8_t, MATRIX_HEIGHT> aliveRow;
+        uint32_t crc = 0xffffffff;
+        for (int i = 0; i < MATRIX_WIDTH; ++i)
+        {
+            for (int j = 0; j < MATRIX_HEIGHT; ++j)
+                aliveRow[j] = world[i][j].alive;
+            crc = uzlib_crc32(aliveRow.data(), aliveRow.size(), crc);
+        }
         for (int i = 0; i < CRC_LENGTH - 1; i++)
             checksums[i] = checksums[i+1];
         checksums[CRC_LENGTH - 1] = crc;
@@ -291,9 +298,9 @@ public:
             if (elapsed < flashTime)
             {
                 auto whiteColor = CRGB(0x60, 0x00, 0x00);
-                g()->fillRectangle(0, 0, MATRIX_WIDTH, MATRIX_HEIGHT, whiteColor);
+                g().fillRectangle(0, 0, MATRIX_WIDTH, MATRIX_HEIGHT, whiteColor);
             }
-            g()->DimAll(255 - 255*elapsed/resetTime);
+            g().DimAll(255 - 255*elapsed/resetTime);
 
             for (int x = 0; x < MATRIX_WIDTH; x++)
                 for (int y = 0; y < MATRIX_HEIGHT; y++)

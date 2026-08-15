@@ -1,3 +1,5 @@
+#pragma once
+
 //+--------------------------------------------------------------------------
 //
 // File:        PatternQR.h
@@ -34,11 +36,13 @@
 
 #include "qrcode.h"
 
+#include <memory>
+
 class PatternQR : public EffectWithId<PatternQR>
 {
     void construct()
     {
-        qrcodeData = (uint8_t *) PreferPSRAMAlloc(qrcode_getBufferSize(qrVersion));
+        qrcodeData = std::make_unique<uint8_t[]>(qrcode_getBufferSize(qrVersion));
         lastData = "";
     }
 
@@ -46,7 +50,7 @@ protected:
 
     String lastData;
     QRCode qrcode;
-    uint8_t * qrcodeData = nullptr;
+    std::unique_ptr<uint8_t[]> qrcodeData;
     const int qrVersion = 2;
 
 public:
@@ -61,10 +65,7 @@ public:
         construct();
     }
 
-    virtual ~PatternQR()
-    {
-        free(qrcodeData);
-    }
+    virtual ~PatternQR() = default;
 
     void Start() override
     {
@@ -77,13 +78,13 @@ public:
 
     void Draw() override
     {
-        String sIP = WiFi.isConnected() ? "http://" + WiFi.localIP().toString() : "No Wifi";
+        String sIP = nd_network::IsWiFiConnected() ? "http://" + nd_network::GetWiFiLocalIP() : "No Wifi";
         if (sIP != lastData)
         {
             lastData = sIP;
-            qrcode_initText(&qrcode, qrcodeData, qrVersion, ECC_LOW, sIP.c_str());
+            qrcode_initText(&qrcode, qrcodeData.get(), qrVersion, ECC_LOW, sIP.c_str());
         }
-        g()->fillScreen(g()->to16bit(CRGB::DarkBlue));
+        g().fillScreen(g().to16bit(CRGB::DarkBlue));
         const int leftMargin = MATRIX_CENTER_X - qrcode.size / 2;
         const int topMargin = 4;
         const int borderSize = 2;
@@ -95,12 +96,17 @@ public:
         int w = qrcode.size + borderSize * 2;
         int h = w;
 
-        g()->fillRect(leftMargin - borderSize, topMargin - borderSize, w, h, BLACK16);
-        g()->drawRect(leftMargin - borderSize, topMargin - borderSize, w, h, borderColor);
+        int startX = leftMargin < 0 ? -leftMargin : 0;
+        int endX = std::min((int)qrcode.size, MATRIX_WIDTH - leftMargin);
 
-        for (uint8_t y = 0; y < qrcode.size; y++)
-            for (uint8_t x = 0; x < qrcode.size; x++)
-                g()->setPixel(leftMargin + x, topMargin + y, (qrcode_getModule(&qrcode, x, y) ? foregroundColor : BLACK16));
+        int startY = topMargin < 0 ? -topMargin : 0;
+        int endY = std::min((int)qrcode.size, MATRIX_HEIGHT - topMargin);
+
+        for (uint8_t y = startY; y < endY; y++) {
+            for (uint8_t x = startX; x < endX; x++) {
+                g().setPixel(leftMargin + x, topMargin + y, (qrcode_getModule(&qrcode, x, y) ? foregroundColor : BLACK16));
+            }
+        }
     }
 };
 

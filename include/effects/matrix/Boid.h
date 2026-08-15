@@ -64,7 +64,6 @@
 // Boid class
 // Methods for Separation, Cohesion, Alignment added
 
-#pragma once
 
 #include "Vector.h"
 
@@ -103,7 +102,7 @@ class Boid
     uint8_t colorIndex = 0;
     float mass;
 
-    boolean enabled = true;
+    bool enabled = true;
 
     Boid() {}
 
@@ -118,7 +117,7 @@ class Boid
     }
 
     static float randomf() {
-      return map((float)random(0, 255), 0.0f, 255.0f, -.5f, .5f);
+      return ::map((float)random(0, 255), 0.0f, 255.0f, -.5f, .5f);
     }
 
     void run(Boid boids [], uint8_t boidCount) {

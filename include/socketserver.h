@@ -1,3 +1,5 @@
+#pragma once
+
 //+--------------------------------------------------------------------------
 //
 // File:        SocketServer.h
@@ -27,24 +29,16 @@
 //
 // History:     Oct-26-2018     Davepl      Created
 //---------------------------------------------------------------------------
-#pragma once
 
+#include "globals.h"
 
-#include "ledbuffer.h"
-
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <iostream>
+#include <atomic>
+#include <limits>
 #include <memory>
 #include <netinet/in.h>
 #include <sys/socket.h>
-#include <unistd.h>
 
-extern "C"
-{
-    #include "uzlib/src/uzlib.h"
-}
+#include "itaskservice.h"
 
 #define STANDARD_DATA_HEADER_SIZE   24                                             // Size of the header for expanded data
 #define COMPRESSED_HEADER_SIZE      16                                             // Size of the header for compressed data
@@ -56,7 +50,22 @@ extern "C"
 #define MAXIMUM_PACKET_SIZE (STANDARD_DATA_HEADER_SIZE + LED_DATA_SIZE * NUM_LEDS) // Header plus 24 bits per actual LED
 #define COMPRESSED_HEADER (0x44415645)                                             // ASCII "DAVE" as header
 
-bool ProcessIncomingData(std::unique_ptr<uint8_t []> & payloadData, size_t payloadLength);
+// Overflow-safe `STANDARD_DATA_HEADER_SIZE + itemCount * itemSize`. Returns
+// false and clears packetSize if the multiply or add would wrap.
+
+inline bool CheckedStandardPacketSize(uint32_t itemCount, size_t itemSize, size_t& packetSize)
+{
+    if (itemSize == 0 || itemCount > (std::numeric_limits<size_t>::max() - STANDARD_DATA_HEADER_SIZE) / itemSize)
+    {
+        packetSize = 0;
+        return false;
+    }
+
+    packetSize = STANDARD_DATA_HEADER_SIZE + itemCount * itemSize;
+    return true;
+}
+
+bool ProcessIncomingData(allocated_unique_ptr<uint8_t []> & payloadData, size_t payloadLength);
 
 #if INCOMING_WIFI_ENABLED
 
@@ -91,142 +100,57 @@ static_assert( sizeof(SocketResponse) == 72, "SocketResponse struct size is not 
 
 // SocketServer
 //
-// Handles incoming connections from the server and pass the data that comes in
+// Handles incoming connections from the server and passes the data that comes
+// in. Inherits ITaskService so the accept/read loop, shutdown signaling, and
+// listening-socket teardown all share the standard service lifecycle.
 
-class SocketServer
+class SocketServer : public ITaskService
 {
 private:
 
     int                         _port;
     int                         _numLeds;
-    int                         _server_fd;
+
+    // Listening socket fd. atomic<int> because release() can be invoked from
+    // both the SocketServer task (Run/begin failure paths) and from the
+    // service-stop path (OnBeforeWaitForStop, called on the caller's thread).
+    // Using atomic exchange ensures only one of those callers actually
+    // close()s the descriptor; the other observes -1 and is a no-op.
+    
+    std::atomic<int>            _server_fd{-1};
     struct sockaddr_in          _address;
-    std::unique_ptr<uint8_t []> _pBuffer;
-    std::unique_ptr<uint8_t []> _abOutputBuffer;
+    allocated_unique_ptr<uint8_t []> _pBuffer;
+    allocated_unique_ptr<uint8_t []> _abOutputBuffer;
 
 public:
 
     size_t                      _cbReceived;
 
-    SocketServer(int port, int numLeds) :
-        _port(port),
-        _numLeds(numLeds),
-        _server_fd(-1),
-        _cbReceived(0)
-    {
-        _abOutputBuffer.reset( psram_allocator<uint8_t>().allocate(MAXIMUM_PACKET_SIZE+1) );        // +1 for uzlib one byte overreach bug
-        memset(&_address, 0, sizeof(_address));
-    }
+    SocketServer(int port, int numLeds);
+    ~SocketServer() override { Stop(); }
 
-    void release()
-    {
-        _pBuffer.reset();
-        if (_server_fd >= 0)
-        {
-            close(_server_fd);
-            _server_fd = -1;
-        }
-    }
+    // IService::Name
+    const char* Name() const override { return "SocketServer"; }
 
-    bool begin()
-    {
-        _pBuffer.reset( psram_allocator<uint8_t>().allocate(MAXIMUM_PACKET_SIZE) );
-        _cbReceived = 0;
+    void release();
+    bool begin();
+    void ResetReadBuffer();
+    void SetLEDCount(size_t numLeds) { _numLeds = numLeds; }
+    size_t GetLEDCount() const { return _numLeds; }
 
-        // Creating socket file descriptor
-        if ((_server_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
-        {
-            debugW("socket error\n");
-            release();
-            return false;
-        }
+  protected:
+    // ITaskService hooks
+    TaskConfig GetTaskConfig() const override;
+    void Run() override;
+    void OnBeforeWaitForStop() override;
 
-        // When an error occurs, and we close and reopen the port, we need to specify reuse flags
-        // or it might be too soon to use the port again, since close doesn't actually close it
-        // until the socket is no longer in use.
-
-        int opt = 1;
-        if (setsockopt(_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)))
-        {
-            perror("setsockopt");
-            release();
-            return false;
-        }
-
-        memset(&_address, 0, sizeof(_address));
-        _address.sin_family = AF_INET;
-        _address.sin_addr.s_addr = INADDR_ANY;
-        _address.sin_port = htons( _port );
-
-        if (bind(_server_fd, (struct sockaddr *)&_address, sizeof(_address)) < 0)       // Bind socket to port
-        {
-            perror("bind failed\n");
-            release();
-            return false;
-        }
-        if (listen(_server_fd, 6) < 0)                                                  // Start listening for connections
-        {
-            perror("listen failed\n");
-            release();
-            return false;
-        }
-        return true;
-    }
-
-
-    void ResetReadBuffer()
-    {
-        _cbReceived = 0;
-        memset(_pBuffer.get(), 0, MAXIMUM_PACKET_SIZE);
-    }
+  public:
 
     // ReadUntilNBytesReceived
     //
     // Read from the socket until the buffer contains at least cbNeeded bytes
 
-    bool ReadUntilNBytesReceived(size_t socket, size_t cbNeeded)
-    {
-        if (cbNeeded <= _cbReceived)                            // If we already have that many bytes, we're already done
-        {
-            debugV("Already had enough data to satisfy read: requested %d, had %d", cbNeeded, _cbReceived);
-            return true;
-        }
-
-        // This test caps maximum packet size as a full buffer read of LED data.  If other packets wind up being longer,
-        // the buffer itself and this test might need to change
-
-        if (cbNeeded > MAXIMUM_PACKET_SIZE)
-        {
-            debugW("Unexpected request for %d bytes in ReadUntilNBytesReceived\n", cbNeeded);
-            return false;
-        }
-
-        do
-        {
-            // If we're reading at a point in the buffer more than just the header, we're actually transferring data, so light up the LED
-
-            // Read data from the socket until we have _bcNeeded bytes in the buffer
-
-            int cbRead = 0;
-            do
-            {
-                cbRead = read(socket, (uint8_t *) _pBuffer.get() + _cbReceived, cbNeeded - _cbReceived);
-            } while (cbRead < 0 && errno == EINTR);
-
-            // Restore the old state
-
-            if (cbRead > 0)
-            {
-                _cbReceived += cbRead;
-            }
-            else
-            {
-                debugW("ERROR: %d bytes read in ReadUntilNBytesReceived trying to read %d\n", cbRead, cbNeeded-_cbReceived);
-                return false;
-            }
-        } while (_cbReceived < cbNeeded);
-        return true;
-    }
+    bool ReadUntilNBytesReceived(size_t socket, size_t cbNeeded);
 
     // ProcessIncomingConnectionsLoop
     //
@@ -239,46 +163,7 @@ public:
     //
     // Use unzlib to decompress a memory buffer
 
-    static bool DecompressBuffer(const uint8_t * pBuffer, size_t cBuffer, uint8_t * pOutput, size_t expectedOutputSize)
-    {
-        debugV("Compressed Data: %02X %02X %02X %02X...", pBuffer[0], pBuffer[1], pBuffer[2], pBuffer[3]);
-
-        struct uzlib_uncomp d = { 0 };
-        uzlib_uncompress_init(&d, nullptr, 0);
-
-        d.source         = pBuffer;
-        d.source_limit   = pBuffer + cBuffer;
-        d.source_read_cb = nullptr;
-        d.dest_start     = pOutput;
-        d.dest           = pOutput;
-
-        // There's an "off by one" bug/feature in uzlib that reaches one byte past the end.  Took forever
-        // to find it...
-
-        d.dest_limit     = pOutput + expectedOutputSize + 1;
-
-        int res = uzlib_zlib_parse_header(&d);
-        if (res < 0)
-        {
-            debugE("ERROR: Cannot parse zlib data header\n");
-            return false;
-        }
-
-        res = uzlib_uncompress_chksum(&d);                                          // Expand the data
-
-        if (res != TINF_DONE) {
-            debugE("Error during decompression after producing %d bytes: %d\n", d.dest - pOutput, res);
-            return false;
-        }
-
-        if (d.dest - pOutput != expectedOutputSize)
-        {
-            debugE("Expected it to to decompress to %d but got %d instead\n", expectedOutputSize, d.dest - pOutput);
-            return false;
-        }
-
-        return true;
-    }
+    static bool DecompressBuffer(const uint8_t * pBuffer, size_t cBuffer, uint8_t * pOutput, size_t expectedOutputSize);
 };
 
 #endif

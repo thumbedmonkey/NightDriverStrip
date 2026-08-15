@@ -1,5 +1,6 @@
 #pragma once
 
+
 #include <bitset>
 
 #include "effectmanager.h"
@@ -25,7 +26,7 @@ class PatternSMStrobeDiffusion : public EffectWithId<PatternSMStrobeDiffusion>
     uint8_t step { 0 }; // some counter of frames or sequences of operations
     // Locations of snowflakes stored in a single flattened bitset (X-major).
     // Index calculation: idx = y * MATRIX_WIDTH + x
-    std::unique_ptr<std::bitset<MATRIX_WIDTH * MATRIX_HEIGHT>> snowBits = make_unique_psram<std::bitset<MATRIX_WIDTH * MATRIX_HEIGHT>>();
+    allocated_unique_ptr<std::bitset<MATRIX_WIDTH * MATRIX_HEIGHT>> snowBits = make_unique_psram<std::bitset<MATRIX_WIDTH * MATRIX_HEIGHT>>();
     uint8_t Speed = 150;                                                             // 1-255 is speed
     uint8_t Scale = 90;                                                              // 1-100 is something parameter
     uint8_t FPSdelay;        // BUGBUG: This is set but never used. :-(
@@ -79,7 +80,7 @@ class PatternSMStrobeDiffusion : public EffectWithId<PatternSMStrobeDiffusion>
     {
         //  	  FPSdelay = 25U; // LOW_DELAY;
         //    hue2 = 1;
-        g()->Clear();
+        g().Clear();
     }
 
     // =========== Christmas Tree ===========
@@ -103,7 +104,7 @@ class PatternSMStrobeDiffusion : public EffectWithId<PatternSMStrobeDiffusion>
                 snowAt(x, y) = snowAt(x, y - 1);
                 if (snowAt(x, y) > 0)
                 {
-                    g()->drawPixel(x, y, CHSV(170, 5U, 127 + random8(128)));
+                    g().drawPixel(x, y, CHSV(170, 5U, 127 + random8(128)));
                 }
             }
         }
@@ -138,8 +139,8 @@ class PatternSMStrobeDiffusion : public EffectWithId<PatternSMStrobeDiffusion>
         {
             // diffusion ---
             // The offset is to skip the VU meter.
-            g()->blur2d(g()->leds, MATRIX_WIDTH, 0, MATRIX_HEIGHT, top_line_offset, beatsin8(3, 64, 80));
-            // g()->blur2d(g()->leds, MATRIX_WIDTH, 0, MATRIX_HEIGHT, top_line_offset,
+            g().blur2d(g().leds, MATRIX_WIDTH, 0, MATRIX_HEIGHT, top_line_offset, beatsin8(3, 64, 80));
+            // g().blur2d(g().leds, MATRIX_WIDTH, 0, MATRIX_HEIGHT, top_line_offset,
             // 24);
             FPSdelay = LOW_DELAY;
             STEP = 1U;
@@ -155,12 +156,12 @@ class PatternSMStrobeDiffusion : public EffectWithId<PatternSMStrobeDiffusion>
             // strob -------
             if (Scale > 25)
             {
-                g()->DimAll(200);
+                g().DimAll(200);
                 FPSdelay = 30;
             }
             else
             {
-                g()->DimAll(24);
+                g().DimAll(24);
                 FPSdelay = 40;
             }
         }
@@ -182,22 +183,22 @@ class PatternSMStrobeDiffusion : public EffectWithId<PatternSMStrobeDiffusion>
             {
                 if ((step % STEP) == 0)
                 { // small layers
-                    g()->drawPixel(MATRIX_WIDTH - 1, y * 3 + DELTA, CHSV(step, 255U, 255U));
+                    g().drawPixel(MATRIX_WIDTH - 1, y * 3 + DELTA, CHSV(step, 255U, 255U));
                 }
                 else
                 {
-                    g()->drawPixel(MATRIX_WIDTH - 1, y * 3 + DELTA, CHSV(170U, 255U, 1U));
+                    g().drawPixel(MATRIX_WIDTH - 1, y * 3 + DELTA, CHSV(170U, 255U, 1U));
                 }
             }
             else
             {
                 if ((step % STEP) == 0)
                 { // big layers
-                    g()->drawPixel(0, y * 3 + DELTA, CHSV((step + deltaHue), 255U, 255U));
+                    g().drawPixel(0, y * 3 + DELTA, CHSV((step + deltaHue), 255U, 255U));
                 }
                 else
                 {
-                    g()->drawPixel(0, y * 3 + DELTA, CHSV(0U, 255U, 0U));
+                    g().drawPixel(0, y * 3 + DELTA, CHSV(0U, 255U, 0U));
                 }
             }
 
@@ -206,11 +207,11 @@ class PatternSMStrobeDiffusion : public EffectWithId<PatternSMStrobeDiffusion>
             {
                 if (dir)
                 { // <==
-                    g()->drawPixel(x, y * 3 + DELTA, g()->getPixel(x, y * 3 + DELTA));
+                    g().drawPixel(x, y * 3 + DELTA, g().getPixel(x, y * 3 + DELTA));
                 }
                 else
                 { // ==>
-                    g()->drawPixel(MATRIX_WIDTH - x, y * 3 + DELTA, g()->getPixel(MATRIX_WIDTH - x, y * 3 + DELTA));
+                    g().drawPixel(MATRIX_WIDTH - x, y * 3 + DELTA, g().getPixel(MATRIX_WIDTH - x, y * 3 + DELTA));
                 }
             }
             dir = !dir;

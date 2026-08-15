@@ -28,21 +28,148 @@
 //
 //---------------------------------------------------------------------------
 
-#include <HTTPClient.h>
-#include <UrlEncode.h>
 #include "globals.h"
+
+#include <algorithm>
+#include <array>
+#include <driver/gpio.h>
+#include <HTTPClient.h>
+#include <memory>
+#include <optional>
+#include <UrlEncode.h>
+
+#include "audioservice.h"
+#include "deviceconfig.h"
+#include "deviceconfig_internal.h"
+#include "effectmanager.h"
+#include "jsonserializer.h"
 #include "systemcontainer.h"
 
 extern const char timezones_start[] asm("_binary_config_timezones_json_start");
 
+// DeviceConfig holds, persists and loads device-wide configuration settings. Effect-specific settings should
+// be managed using overrides of the respective methods in LEDStripEffect (mainly FillSettingSpecs(),
+// SerializeSettingsToJSON() and SetSetting()).
+//
+// Adding a setting to the list of known/saved settings requires the following:
+// 1. Adding the setting variable to the list at the top of the class definition
+// 2. Adding a corresponding Tag to the list of static constexpr const char * strings further below
+// 3. Adding a corresponding SettingSpec in the GetSettingSpecs() function
+// 4. Adding logic to set a default in case the JSON load isn't possible in the DeviceConfig() constructor
+//    (in deviceconfig.cpp)
+// 5. Adding (de)serialization logic for the setting to the SerializeToJSON()/DeserializeFromJSON() methods
+// 6. Adding a Get/Set method for the setting (and, where applicable, their implementation in deviceconfig.cpp)
+// 7. If you've added an entry to secrets.example.h to define a default value for your setting then add a
+//    test at the top of this file to confirm that the new #define is found. This prevents drift when users
+//    have an existing tree and don't know to refresh their modified version of secrets.h.
+//
+// For the first 5 points, a comment has been added to the respective place in the existing code.
+// Generally speaking, one will also want to add logic to the webserver to retrieve and set the setting.
+
 void DeviceConfig::SaveToJSON() const
 {
-    g_ptrSystem->JSONWriter().FlagWriter(writerIndex);
+    g_ptrSystem->GetJSONWriter().FlagWriter(writerIndex);
+}
+
+std::array<int8_t, NUM_CHANNELS> DeviceConfig::GetCompiledWS281xPins()
+{
+    return DeviceConfigInternal::GetCompiledWS281xPins();
+}
+
+std::array<int8_t, NUM_CHANNELS> DeviceConfig::GetCompiledAPA102ClockPins()
+{
+    return DeviceConfigInternal::GetCompiledAPA102ClockPins();
+}
+
+const char* DeviceConfig::DriverName(OutputDriver driver)
+{
+    switch (driver)
+    {
+        case OutputDriver::M5LCD:
+            return "m5lcd";
+
+        case OutputDriver::HUB75:
+            return "hub75";
+
+        case OutputDriver::APA102:
+            return "apa102";
+
+        case OutputDriver::WS281x:
+        default:
+            return "ws281x";
+    }
+}
+
+DeviceConfig::WS281xColorOrder DeviceConfig::GetCompiledWS281xColorOrder()
+{
+    return DeviceConfigInternal::GetCompiledWS281xColorOrder();
+}
+
+String DeviceConfig::GetColorOrderName(WS281xColorOrder colorOrder)
+{
+    switch (colorOrder)
+    {
+        case WS281xColorOrder::RGB: return "RGB";
+        case WS281xColorOrder::RBG: return "RBG";
+        case WS281xColorOrder::GRB: return "GRB";
+        case WS281xColorOrder::GBR: return "GBR";
+        case WS281xColorOrder::BRG: return "BRG";
+        case WS281xColorOrder::BGR: return "BGR";
+        default:                    return "GRB";
+    }
+}
+
+bool DeviceConfig::IsHub75Build()
+{
+    return GetCompiledOutputDriver() == OutputDriver::HUB75;
+}
+
+bool DeviceConfig::IsFixedMatrixBuild()
+{
+    return IsHub75Build() || GetCompiledOutputDriver() == OutputDriver::M5LCD;
+}
+
+void DeviceConfig::LogRuntimeConfig(const char* reason) const
+{
+    String activePins;
+    for (size_t i = 0; i < runtimeOutputs.channelCount && i < runtimeOutputs.outputPins.size(); ++i)
+    {
+        if (!activePins.isEmpty())
+            activePins += ',';
+        activePins += String(runtimeOutputs.outputPins[i]);
+    }
+
+    String activeClockPins;
+    for (size_t i = 0; i < runtimeOutputs.channelCount && i < runtimeOutputs.clockPins.size(); ++i)
+    {
+        if (!activeClockPins.isEmpty())
+            activeClockPins += ',';
+        activeClockPins += String(runtimeOutputs.clockPins[i]);
+    }
+
+    debugI("Runtime config (%s): driver=%s matrix=%ux%u leds=%u serpentine=%d channels=%u colorOrder=%s audioPin=%d",
+           reason,
+           DriverName(runtimeOutputs.driver),
+           runtimeTopology.width,
+           runtimeTopology.height,
+           static_cast<unsigned>(GetActiveLEDCount()),
+           runtimeTopology.serpentine,
+            static_cast<unsigned>(runtimeOutputs.channelCount),
+           GetColorOrderName(runtimeOutputs.colorOrder).c_str(),
+           audioInputPin);
+    debugI("Runtime config pins (%s): data=%s clock=%s", reason, activePins.c_str(), activeClockPins.c_str());
 }
 
 DeviceConfig::DeviceConfig()
 {
-    writerIndex = g_ptrSystem->JSONWriter().RegisterWriter(
+    runtimeTopology.serpentine = !IsFixedMatrixBuild();
+    runtimeOutputs.driver = GetCompiledOutputDriver();
+    runtimeOutputs.channelCount = NUM_CHANNELS;
+    runtimeOutputs.outputPins = GetCompiledWS281xPins();
+    runtimeOutputs.clockPins = GetCompiledAPA102ClockPins();
+    runtimeOutputs.colorOrder = GetCompiledWS281xColorOrder();
+
+    writerIndex = g_ptrSystem->GetJSONWriter().RegisterWriter(
         [this] { assert(SaveToJSONFile(DEVICE_CONFIG_FILE, *this)); }
     );
 
@@ -62,8 +189,363 @@ DeviceConfig::DeviceConfig()
 
         SaveToJSON();
     }
+
+    LogRuntimeConfig("init");
 }
 
+bool DeviceConfig::SerializeToJSON(JsonObject& jsonObject)
+{
+    return SerializeToJSON(jsonObject, true);
+}
+
+bool DeviceConfig::SerializeToJSON(JsonObject& jsonObject, bool includeSensitive)
+{
+    auto jsonDoc = CreateJsonDocument();
+
+    // Add serialization logic for additional settings to this code
+    jsonDoc[HostnameTag] = hostname;
+    jsonDoc[LocationTag] = location;
+    jsonDoc[LocationIsZipTag] = locationIsZip;
+    jsonDoc[CountryCodeTag] = countryCode;
+    jsonDoc[TimeZoneTag] = timeZone;
+    jsonDoc[Use24HourClockTag] = use24HourClock;
+    jsonDoc[UseCelsiusTag] = useCelsius;
+    jsonDoc[NTPServerTag] = ntpServer;
+    jsonDoc[RememberCurrentEffectTag] = rememberCurrentEffect;
+    jsonDoc[RemoteEffectButtonsResetIntervalTag] = remoteEffectButtonsResetInterval;
+    jsonDoc[PowerLimitTag] = powerLimit;
+    jsonDoc[PowerLimitDefaultTag] = POWER_LIMIT_DEFAULT;
+    // Only serialize showVUMeter if the VU meter is enabled in the build
+    #if SHOW_VU_METER
+    jsonDoc[ShowVUMeterTag] = showVUMeter;
+    #endif
+    jsonDoc[BrightnessTag] = brightness;
+    jsonDoc[GlobalColorTag] = globalColor;
+    jsonDoc[ApplyGlobalColorsTag] = applyGlobalColors;
+    jsonDoc[SecondColorTag] = secondColor;
+    jsonDoc[AudioInputPinTag] = audioInputPin;
+    jsonDoc[MatrixWidthTag] = runtimeTopology.width;
+    jsonDoc[MatrixHeightTag] = runtimeTopology.height;
+    jsonDoc[MatrixSerpentineTag] = runtimeTopology.serpentine;
+    jsonDoc[OutputDriverTag] = DriverName(runtimeOutputs.driver);
+    jsonDoc[WS281xChannelCountTag] = runtimeOutputs.channelCount;
+    jsonDoc[WS281xColorOrderTag] = GetColorOrderName(runtimeOutputs.colorOrder);
+
+    auto ws281xPins = jsonDoc[WS281xPinsTag].to<JsonArray>();
+    for (auto pin : runtimeOutputs.outputPins)
+        ws281xPins.add(pin);
+
+    auto apa102ClockPins = jsonDoc[APA102ClockPinsTag].to<JsonArray>();
+    for (auto pin : runtimeOutputs.clockPins)
+        apa102ClockPins.add(pin);
+
+    if (includeSensitive)
+        jsonDoc[OpenWeatherApiKeyTag] = openWeatherApiKey;
+
+    return SetIfNotOverflowed(jsonDoc, jsonObject, __PRETTY_FUNCTION__);
+}
+
+bool DeviceConfig::DeserializeFromJSON(const JsonObjectConst& jsonObject)
+{
+    return DeserializeFromJSON(jsonObject, false);
+}
+
+bool DeviceConfig::DeserializeFromJSON(const JsonObjectConst& jsonObject, bool skipWrite)
+{
+    // If we're told to ignore saved config, we shouldn't touch anything
+    if (IGNORE_SAVED_DEVICE_CONFIG)
+        return true;
+
+    // Add deserialization logic for additional settings to this code
+    SetIfPresentIn(jsonObject, hostname, HostnameTag);
+    SetIfPresentIn(jsonObject, location, LocationTag);
+    SetIfPresentIn(jsonObject, locationIsZip, LocationIsZipTag);
+    SetIfPresentIn(jsonObject, countryCode, CountryCodeTag);
+    SetIfPresentIn(jsonObject, openWeatherApiKey, OpenWeatherApiKeyTag);
+    SetIfPresentIn(jsonObject, use24HourClock, Use24HourClockTag);
+    SetIfPresentIn(jsonObject, useCelsius, UseCelsiusTag);
+    SetIfPresentIn(jsonObject, ntpServer, NTPServerTag);
+    SetIfPresentIn(jsonObject, rememberCurrentEffect, RememberCurrentEffectTag);
+    SetIfPresentIn(jsonObject, remoteEffectButtonsResetInterval, RemoteEffectButtonsResetIntervalTag);
+    if (jsonObject[PowerLimitTag].is<int>())
+    {
+        const int savedPowerLimit = jsonObject[PowerLimitTag].as<int>();
+        #ifdef POWER_LIMIT_MW
+        if (!jsonObject[PowerLimitDefaultTag].is<int>() && savedPowerLimit == POWER_LIMIT_LEGACY_DEFAULT)
+        {
+            debugW("Ignoring saved legacy powerLimit default %d; using compiled default %d", savedPowerLimit, POWER_LIMIT_DEFAULT);
+            powerLimit = POWER_LIMIT_DEFAULT;
+        }
+        else
+        #endif
+        {
+            auto [isValid, validationMessage] = ValidatePowerLimit(savedPowerLimit);
+            if (isValid)
+                powerLimit = savedPowerLimit;
+            else
+            {
+                debugW("Ignoring saved powerLimit %d: %s", savedPowerLimit, validationMessage.c_str());
+                powerLimit = POWER_LIMIT_DEFAULT;
+            }
+        }
+    }
+    SetIfPresentIn(jsonObject, brightness, BrightnessTag);
+    // Persisted config predates the newer brightness guardrails in some installs, so treat an invalid
+    // saved brightness as "unset" and fall back to the normal 100% default instead of booting dark.
+    if (brightness < BRIGHTNESS_MIN || brightness > BRIGHTNESS_MAX)
+        brightness = BRIGHTNESS_MAX;
+    // Only deserialize showVUMeter if the VU meter is enabled in the build
+    #if SHOW_VU_METER
+    SetIfPresentIn(jsonObject, showVUMeter, ShowVUMeterTag);
+    #endif
+    SetIfPresentIn(jsonObject, globalColor, GlobalColorTag);
+    SetIfPresentIn(jsonObject, applyGlobalColors, ApplyGlobalColorsTag);
+    SetIfPresentIn(jsonObject, secondColor, SecondColorTag);
+    if (jsonObject[AudioInputPinTag].is<int>())
+    {
+        const int persistedAudioInputPin = jsonObject[AudioInputPinTag].as<int>();
+        auto [pinValid, _] = ValidateAudioInputPin(persistedAudioInputPin);
+        audioInputPin = pinValid ? persistedAudioInputPin : GetCompiledAudioInputPin();
+    }
+
+    RuntimeConfig updated = GetRuntimeConfig();
+
+    SetIfPresentIn(jsonObject, updated.topology.width, MatrixWidthTag);
+    SetIfPresentIn(jsonObject, updated.topology.height, MatrixHeightTag);
+    SetIfPresentIn(jsonObject, updated.topology.serpentine, MatrixSerpentineTag);
+
+    if (jsonObject[OutputDriverTag].is<String>())
+    {
+        const auto driverName = jsonObject[OutputDriverTag].as<String>();
+        if (driverName == DriverName(OutputDriver::HUB75))
+            updated.outputs.driver = OutputDriver::HUB75;
+        else if (driverName == DriverName(OutputDriver::M5LCD))
+            updated.outputs.driver = OutputDriver::M5LCD;
+        else if (driverName == DriverName(OutputDriver::APA102))
+            updated.outputs.driver = OutputDriver::APA102;
+        else if (driverName == DriverName(OutputDriver::WS281x))
+            updated.outputs.driver = OutputDriver::WS281x;
+    }
+
+    if (jsonObject[WS281xChannelCountTag].is<size_t>())
+        updated.outputs.channelCount = jsonObject[WS281xChannelCountTag].as<size_t>();
+
+    if (jsonObject[WS281xColorOrderTag].is<String>())
+    {
+        const auto colorOrderName = jsonObject[WS281xColorOrderTag].as<String>();
+        if (colorOrderName == "RGB") updated.outputs.colorOrder = WS281xColorOrder::RGB;
+        else if (colorOrderName == "RBG") updated.outputs.colorOrder = WS281xColorOrder::RBG;
+        else if (colorOrderName == "GRB") updated.outputs.colorOrder = WS281xColorOrder::GRB;
+        else if (colorOrderName == "GBR") updated.outputs.colorOrder = WS281xColorOrder::GBR;
+        else if (colorOrderName == "BRG") updated.outputs.colorOrder = WS281xColorOrder::BRG;
+        else if (colorOrderName == "BGR") updated.outputs.colorOrder = WS281xColorOrder::BGR;
+    }
+
+    if (jsonObject[WS281xPinsTag].is<JsonArrayConst>())
+    {
+        auto pinArray = jsonObject[WS281xPinsTag].as<JsonArrayConst>();
+        for (size_t i = 0; i < updated.outputs.outputPins.size() && i < pinArray.size(); ++i)
+        {
+            if (pinArray[i].is<int>())
+                updated.outputs.outputPins[i] = pinArray[i].as<int>();
+        }
+    }
+
+    if (jsonObject[APA102ClockPinsTag].is<JsonArrayConst>())
+    {
+        auto pinArray = jsonObject[APA102ClockPinsTag].as<JsonArrayConst>();
+        for (size_t i = 0; i < updated.outputs.clockPins.size() && i < pinArray.size(); ++i)
+        {
+            if (pinArray[i].is<int>())
+                updated.outputs.clockPins[i] = pinArray[i].as<int>();
+        }
+    }
+
+    auto [runtimeConfigValid, runtimeConfigError] = SetRuntimeConfig(updated, true);
+    if (!runtimeConfigValid)
+        debugW("Ignoring invalid persisted runtime config: %s", runtimeConfigError.c_str());
+
+    if (ntpServer.isEmpty())
+        ntpServer = NTP_SERVER_DEFAULT;
+
+    if (jsonObject[TimeZoneTag].is<String>())
+        return SetTimeZone(jsonObject[TimeZoneTag], true);
+
+    if (!skipWrite)
+        SaveToJSON();
+
+    return true;
+}
+
+void DeviceConfig::RemovePersisted()
+{
+    RemoveJSONFile(DEVICE_CONFIG_FILE);
+}
+
+const String& DeviceConfig::GetTimeZone() const
+{
+    return timeZone;
+}
+
+void DeviceConfig::Set24HourClock(bool new24HourClock)
+{
+    SetAndSave(use24HourClock, new24HourClock);
+}
+
+void DeviceConfig::SetHostname(const String &newHostname)
+{
+    SetAndSave(hostname, newHostname);
+}
+
+void DeviceConfig::SetLocation(const String &newLocation)
+{
+    SetAndSave(location, newLocation);
+}
+
+void DeviceConfig::SetCountryCode(const String &newCountryCode)
+{
+    SetAndSave(countryCode, newCountryCode);
+}
+
+void DeviceConfig::SetLocationIsZip(bool newLocationIsZip)
+{
+    SetAndSave(locationIsZip, newLocationIsZip);
+}
+
+void DeviceConfig::SetOpenWeatherAPIKey(const String &newOpenWeatherAPIKey)
+{
+    SetAndSave(openWeatherApiKey, newOpenWeatherAPIKey);
+}
+
+void DeviceConfig::SetUseCelsius(bool newUseCelsius)
+{
+    SetAndSave(useCelsius, newUseCelsius);
+}
+
+void DeviceConfig::SetNTPServer(const String &newNTPServer)
+{
+    SetAndSave(ntpServer, newNTPServer);
+}
+
+void DeviceConfig::SetRememberCurrentEffect(bool newRememberCurrentEffect)
+{
+    SetAndSave(rememberCurrentEffect, newRememberCurrentEffect);
+}
+
+void DeviceConfig::SetRemoteEffectButtonsResetInterval(bool newRemoteEffectButtonsResetInterval)
+{
+    SetAndSave(remoteEffectButtonsResetInterval, newRemoteEffectButtonsResetInterval);
+}
+
+SuccessResultWithMessage DeviceConfig::ValidateBrightness(int newBrightness)
+{
+    if (newBrightness < BRIGHTNESS_MIN)
+        return { false, String("brightness is below minimum value of ") + BRIGHTNESS_MIN };
+
+    if (newBrightness > BRIGHTNESS_MAX)
+        return { false, String("brightness is above maximum value of ") + BRIGHTNESS_MAX };
+
+    return { true, "" };
+}
+
+SuccessResultWithMessage DeviceConfig::ValidateBrightness(const String& newBrightness)
+{
+    return ValidateBrightness(newBrightness.toInt());
+}
+
+void DeviceConfig::SetBrightness(int newBrightness)
+{
+    SetAndSave(brightness, uint8_t(std::clamp<int>(newBrightness, BRIGHTNESS_MIN, BRIGHTNESS_MAX)));
+}
+
+void DeviceConfig::SetShowVUMeter(bool newShowVUMeter)
+{
+    // We only actually persist if the VU meter is enabled in the build
+    #if SHOW_VU_METER
+    SetAndSave(showVUMeter, newShowVUMeter);
+    #else
+    showVUMeter = newShowVUMeter;
+    #endif
+}
+
+SuccessResultWithMessage DeviceConfig::ValidatePowerLimit(int newPowerLimit)
+{
+    if (newPowerLimit < POWER_LIMIT_MIN)
+        return { false, String("powerLimit is below minimum value of ") + POWER_LIMIT_MIN };
+
+    return { true, "" };
+}
+
+SuccessResultWithMessage DeviceConfig::ValidatePowerLimit(const String& newPowerLimit)
+{
+    return ValidatePowerLimit(newPowerLimit.toInt());
+}
+
+void DeviceConfig::SetPowerLimit(int newPowerLimit)
+{
+    auto [isValid, _] = ValidatePowerLimit(newPowerLimit);
+    if (isValid)
+        SetAndSave(powerLimit, newPowerLimit);
+}
+
+void DeviceConfig::SetApplyGlobalColors()
+{
+    SetAndSave(applyGlobalColors, true);
+}
+
+void DeviceConfig::ClearApplyGlobalColors()
+{
+    SetAndSave(applyGlobalColors, false);
+}
+
+void DeviceConfig::SetGlobalColor(const CRGB& newGlobalColor)
+{
+    SetAndSave(globalColor, newGlobalColor);
+}
+
+void DeviceConfig::SetSecondColor(const CRGB& newSecondColor)
+{
+    SetAndSave(secondColor, newSecondColor);
+}
+
+SuccessResultWithMessage DeviceConfig::ValidateAudioInputPin(int pin) const
+{
+    if (pin < -1)
+        return { false, "audio input pin must be -1 or a valid GPIO" };
+
+    if (pin == GetCompiledAudioInputPin())
+        return { true, "" };
+
+    // The settings API now separates "compiled default" from "active value". External I2S mics can
+    // move their DIN pin at boot, but the M5 onboard mic path and the current ADC path are still fixed.
+    if (!SupportsConfigurableAudioInputPin())
+        return { false, DeviceConfigInternal::RecompileNeededMessage() };
+
+    if (pin == -1)
+        return { true, "" };
+
+    if (!GPIO_IS_VALID_GPIO(static_cast<gpio_num_t>(pin)))
+        return { false, "audio input pin must be a valid GPIO" };
+
+    return { true, "" };
+}
+
+void DeviceConfig::SetAudioInputPin(int newAudioInputPin)
+{
+    auto [isValid, _] = ValidateAudioInputPin(newAudioInputPin);
+    if (!isValid)
+        return;
+
+    if (audioInputPin == newAudioInputPin)
+        return;
+
+    SetAndSave(audioInputPin, static_cast<int8_t>(newAudioInputPin));
+    LogRuntimeConfig("audio input pin changed");
+}
+
+// This setter separates "apply the timezone to the running process" from "persist a user edit".
+// Startup/config-load needs to set TZ immediately so localtime() is correct, but it must not
+// immediately rewrite device.cfg just because we re-applied the already-persisted value.
 // The timezone JSON file used by this logic is generated using tools/gen-tz-json.py
 bool DeviceConfig::SetTimeZone(const String& newTimeZone, bool skipWrite)
 {
@@ -89,7 +571,7 @@ bool DeviceConfig::SetTimeZone(const String& newTimeZone, bool skipWrite)
 
         size_t length = end - start;
 
-        std::unique_ptr<char[]> value = make_unique_psram<char[]>(length + 1);
+        std::unique_ptr<char[]> value = std::make_unique<char[]>(length + 1);
         strncpy(value.get(), start, length);
         value[length] = 0;
 
@@ -105,7 +587,8 @@ bool DeviceConfig::SetTimeZone(const String& newTimeZone, bool skipWrite)
     return true;
 }
 
-DeviceConfig::ValidateResponse DeviceConfig::ValidateOpenWeatherAPIKey(const String &newOpenWeatherAPIKey)
+#if ENABLE_WIFI
+SuccessResultWithMessage DeviceConfig::ValidateOpenWeatherAPIKey(const String &newOpenWeatherAPIKey)
 {
     HTTPClient http;
 
@@ -142,61 +625,4 @@ DeviceConfig::ValidateResponse DeviceConfig::ValidateOpenWeatherAPIKey(const Str
         }
     }
 }
-
-void DeviceConfig::SetColorSettings(const CRGB& newGlobalColor, const CRGB& newSecondColor)
-{
-    globalColor = newGlobalColor;
-    secondColor = newSecondColor;
-    applyGlobalColors = true;
-
-    SaveToJSON();
-}
-
-// This function contains the logic for dealing with the various color-related settings we have.
-// The logic effectively mimics the behavior of pressing a color button on the IR remote control when (only) the
-// global color is set or (re)applied, but also allows the secondary global palette color to be specified directly.
-// The code in this function figures out how to prioritize and combine the values of (optional) settings; the actual
-// logic for applying the correct color(s) and palette is contained in a number of EffectManager member functions.
-void DeviceConfig::ApplyColorSettings(std::optional<CRGB> newGlobalColor, std::optional<CRGB> newSecondColor, bool clearGlobalColor, bool forceApplyGlobalColor)
-{
-    // If we're asked to clear the global color, we'll remember any colors we were passed, but won't do anything with them
-    if (clearGlobalColor)
-    {
-        if (newGlobalColor.has_value())
-            globalColor = newGlobalColor.value();
-        if (newSecondColor.has_value())
-            secondColor = newSecondColor.value();
-
-        g_ptrSystem->EffectManager().ClearRemoteColor();
-
-        applyGlobalColors = false;
-
-        SaveToJSON();
-
-        return;
-    }
-
-    CRGB finalGlobalColor = newGlobalColor.has_value() ? newGlobalColor.value() : globalColor;
-    forceApplyGlobalColor = forceApplyGlobalColor || newGlobalColor.has_value();
-
-    // If we were given a second color, set it and the global one if necessary. Then have EffectManager do its thing...
-    if (newSecondColor.has_value())
-    {
-        if (forceApplyGlobalColor)
-        {
-            applyGlobalColors = true;
-            globalColor = finalGlobalColor;
-        }
-
-        secondColor = newSecondColor.value();
-
-        g_ptrSystem->EffectManager().ApplyGlobalPaletteColors();
-
-        SaveToJSON();
-    }
-    else if (forceApplyGlobalColor)
-    {
-        // ...otherwise, apply the "set global color" logic if we were asked to do so
-        g_ptrSystem->EffectManager().ApplyGlobalColor(finalGlobalColor);
-    }
-}
+#endif  // ENABLE_WIFI

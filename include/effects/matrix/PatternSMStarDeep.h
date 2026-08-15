@@ -4,7 +4,7 @@
 #include <algorithm> // for std::swap
 #include <cmath>     // for fabsf
 #include <memory>    // for std::unique_ptr
-#include "types.h"   // for make_unique_psram
+#include "types.h"
 
 // Inspired by https://editor.soulmatelights.com/gallery/1166-stars-beta-ver
 // The original has a bunch of Palette management stuff we just didn't
@@ -23,7 +23,7 @@ class PatternSMStarDeep : public EffectWithId<PatternSMStarDeep>
         int position;    // delay the start of the star relative to the counter
     };
 
-    std::unique_ptr<StarData[]> stars; // Dynamically allocated in PSRAM
+    allocated_unique_ptr<StarData[]> stars; // Dynamically allocated in PSRAM
     uint8_t nStars;            // number of active stars
 
     float driftx, drifty;
@@ -55,7 +55,7 @@ class PatternSMStarDeep : public EffectWithId<PatternSMStarDeep>
     {
         if (numPoints == 0) return;
 
-        const CRGB starColor = g()->IsPalettePaused() ? g()->ColorFromCurrentPalette(colorIndex) : ColorFromPalette(*curPalette, colorIndex);
+        const CRGB starColor = g().IsPalettePaused() ? g().ColorFromCurrentPalette(colorIndex) : ColorFromPalette(*curPalette, colorIndex);
         const uint8_t angle_step = 255 / numPoints;
 
         for (uint8_t i = 0; i < numPoints; i++)
@@ -79,7 +79,7 @@ class PatternSMStarDeep : public EffectWithId<PatternSMStarDeep>
 
     // Custom line drawing function.
     // This implementation is kept for its specific visual characteristics ("funky wrapping corners"),
-    // which differ from the standard g()->DrawLine().
+    // which differ from the standard g().DrawLine().
     void DrawStarLine(int x1, int y1, int x2, int y2, CRGB color)
     {
         int x, y;
@@ -108,9 +108,9 @@ class PatternSMStarDeep : public EffectWithId<PatternSMStarDeep>
         for (x = x1; x <= x2; x++)
         {
             if (isSteep)
-                g()->drawPixel(y, MATRIX_HEIGHT - 1 - x, color);
+                g().drawPixel(y, MATRIX_HEIGHT - 1 - x, color);
             else
-                g()->drawPixel(x, MATRIX_HEIGHT - 1 - y, color);
+                g().drawPixel(x, MATRIX_HEIGHT - 1 - y, color);
             err -= dy;
             if (err < 0)
             {
@@ -122,7 +122,7 @@ class PatternSMStarDeep : public EffectWithId<PatternSMStarDeep>
 
     void Start() override
     {
-        g()->Clear();
+        g().Clear();
 
         // Set an initial location and movement vector for the animation center.
         driftx = random8(4, MATRIX_WIDTH - 4);
@@ -149,7 +149,7 @@ class PatternSMStarDeep : public EffectWithId<PatternSMStarDeep>
 
     void Draw() override
     {
-        g()->DimAll(175U);
+        g().DimAll(175U);
         counter++;
 
         // Update drift center position, bouncing off the edges of the defined drift area.

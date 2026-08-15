@@ -14,7 +14,7 @@ class PatternSMRainbowTunnel : public EffectWithId<PatternSMRainbowTunnel>
 
     void Start() override
     {
-        g()->Clear();
+        g().Clear();
     }
 
     void Draw() override
@@ -26,7 +26,7 @@ class PatternSMRainbowTunnel : public EffectWithId<PatternSMRainbowTunnel>
         static uint16_t t;
 
         t += speed;
-        const auto& rMap = HUB75GFX::getPolarMap();
+        const auto& rMap = GFXBase::getPolarMap();
 
         for (uint8_t x = 0; x < MATRIX_WIDTH; x++)
         {
@@ -34,7 +34,7 @@ class PatternSMRainbowTunnel : public EffectWithId<PatternSMRainbowTunnel>
             {
                 uint8_t angle = rMap[x][y].angle;
                 uint8_t radius = rMap[x][y].scaled_radius;
-                g()->leds[XY(x, y)] =
+                g().leds[XY(x, y)] =
                     CHSV((angle * scaleX) - t + (radius * scaleY), 255, constrain(radius * 3, 0, 255));
             }
         }

@@ -1,0 +1,899 @@
+//+--------------------------------------------------------------------------
+//
+// File:        debug_cli.cpp
+//
+// NightDriverStrip - (c) 2025 Plummer's Software LLC.  All Rights Reserved.
+//
+// This file is part of the NightDriver software project.
+//
+//    NightDriver is free software: you can redistribute it and/or modify
+//    it under the terms of the GNU General Public License as published by
+//    the Free Software Foundation, either version 3 of the License, or
+//    (at your option) any later version.
+//
+//    NightDriver is distributed in the hope that it will be useful,
+//    but WITHOUT ANY WARRANTY; without even the implied warranty of
+//    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//    GNU General Public License for more details.
+//
+//    You should have received a copy of the GNU General Public License
+//    along with Nightdriver.  It is normally found in copying.txt
+//    If not, see <https://www.gnu.org/licenses/>.
+//
+// Description:
+//
+//    Implementation of debugging command line interface to NightDriver.
+//
+
+#include "globals.h"
+
+#include <algorithm>
+#include <cctype>
+#include <charconv>
+#include <cstring>
+#include <esp_heap_caps.h>
+#include <esp_log.h>
+#include <esp_system.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <FS.h>
+#include <optional>
+#include <SPIFFS.h>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "console.h"
+#include "debug_cli.h"
+#include "deviceconfig.h"
+#include "effectmanager.h"
+#include "gfxbase.h"
+#include "ledstripeffect.h"
+#include "nd_network.h"
+#include "soundanalyzer.h"
+#include "systemcontainer.h"
+
+#if USE_MATRIX && ENABLE_WIFI
+#include "effects/matrix/PatternStocks.h"
+#endif
+
+namespace DebugCLI
+{
+
+//
+// Private Globals
+//
+static std::vector<const command *> g_CommandTable;
+
+//
+// Tokenizer (Internal)
+// Uses NVRO to allocate in caller's frame to make array of pointer
+// pairs of starts/ends. No copies. No allocs.
+// Simple quoting like 'setname "My Cool Blinkies"' is supported.
+//
+static std::vector<std::string_view> Tokenize(std::string_view input)
+{
+    std::vector<std::string_view> output;
+    size_t start = 0;
+    bool in_quotes = false;
+
+    const size_t input_len = input.length();
+    for (size_t i = 0; i < input_len; ++i)
+    {
+        char c = input[i];
+
+        if (in_quotes)
+        {
+            if (c == '"')
+            {
+                size_t len = i - start;
+                output.push_back(input.substr(start, len));
+                in_quotes = false;
+                start = i + 1;
+            }
+            continue;
+        }
+
+        if (std::isspace(c))
+        {
+            if (i > start)
+            {
+                output.push_back(input.substr(start, i - start));
+            }
+            start = i + 1;
+        }
+        else if (c == '"')
+        {
+            if (i > start)
+            {
+                output.push_back(input.substr(start, i - start));
+            }
+            start = i + 1;
+            in_quotes = true;
+        }
+    }
+
+    if (start < input.length())
+    {
+        output.push_back(input.substr(start));
+    }
+
+    return output;
+}
+
+//
+// String Comparison
+//
+bool StringCompareInsensitive(std::string_view sv, const char *in_s)
+{
+    if (!in_s)
+        return false;
+    const unsigned char *s = (const unsigned char *)in_s;
+    for (unsigned char c : sv)
+    {
+        if (!*s || tolower(c) != tolower(*s))
+            return false;
+        s++;
+    }
+    return *s == '\0';
+}
+
+bool StringStartsWithInsensitive(std::string_view haystack, std::string_view needle)
+{
+    if (needle.length() > haystack.length())
+        return false;
+    return std::equal(needle.begin(), needle.end(), haystack.begin(),
+                      [](char ch1, char ch2) { return std::tolower(ch1) == std::tolower(ch2); });
+}
+
+bool ContainsInsensitive(std::string_view haystack, std::string_view needle)
+{
+    if (needle.empty())
+        return true;
+    auto it = std::search(haystack.begin(), haystack.end(), needle.begin(), needle.end(),
+                          [](char ch1, char ch2) { return std::tolower(ch1) == std::tolower(ch2); });
+    return it != haystack.end();
+}
+
+
+//
+// Registration
+//
+void RegisterCommand(const command *cmd)
+{
+    if (cmd)
+        g_CommandTable.push_back(cmd);
+}
+
+void RegisterCommands(const command *cmds, size_t count)
+{
+    for (size_t i = 0; i < count; i++)
+    {
+        g_CommandTable.push_back(&cmds[i]);
+    }
+}
+
+//
+// Core Command Helpers
+//
+static void PrintHelp(const cli_argv &argv)
+{
+    if (argv.size() > 1)
+    {
+        std::string_view target = argv[1];
+        const command *match = nullptr;
+        int matches = 0;
+
+        for (const auto *cmd : g_CommandTable)
+        {
+            if (StringCompareInsensitive(target, cmd->command))
+            {
+                match = cmd;
+                matches = 1;
+                break;
+            }
+            if (StringStartsWithInsensitive(cmd->command, target))
+            {
+                match = cmd;
+                matches++;
+            }
+        }
+
+        if (matches == 1 && match)
+        {
+            cli_printf("%-20s %s\n", match->command, match->help);
+        }
+        else
+        {
+            cli_printf("Command '%.*s' not found or ambiguous.\n", (int)target.length(), target.data());
+        }
+    }
+    else
+    {
+        for (const auto *cmd : g_CommandTable)
+        {
+            cli_printf("%-20s %s\n", cmd->command, cmd->help);
+        }
+    }
+}
+
+//
+// _activeSession - thread-local pointer to the session currently dispatching a command.
+// Set by RunCommand so that cli_printf knows where to direct output.
+// Falls back to Broadcast if called from outside a RunCommand context.
+//
+static thread_local std::shared_ptr<ConsoleSession> _activeSession;
+
+//
+// Parse and run cmd_line. Zero copies or allocations.
+//
+void RunCommand(std::string_view cmd_line, std::shared_ptr<ConsoleSession> session)
+{
+    const auto argv = Tokenize(cmd_line);
+
+    // Pin output to this session for the duration of the command.
+    std::shared_ptr<ConsoleSession> previous = _activeSession;
+    _activeSession = session;
+
+    // If command is valid
+    if (!argv.empty())
+    {
+        auto it = std::find_if(g_CommandTable.begin(), g_CommandTable.end(),
+                               [&](const command *c) { return StringCompareInsensitive(argv[0], c->command); });
+
+        if (it != g_CommandTable.end())
+        {
+            if ((*it)->announcement)
+            {
+                session->WriteText((*it)->announcement);
+                session->WriteText("\n");
+            }
+            (*it)->helper(argv);
+        }
+        else
+        {
+            cli_printf("Unknown command: %.*s\n", (int)argv[0].length(), argv[0].data());
+        }
+    }
+
+    _activeSession = previous;
+
+    // Always emit prompt after command execution (or empty command)
+    if (session) {
+        session->WriteRaw("> ");
+        session->Flush();
+    }
+}
+
+// If you have command 'reboot', reb<TAB> will complete "reboot". Caller will
+// print a space that's not in the command until newline is found. It will
+// not complete arguments, e.g. not 'reboot n<tab>' would not complete the
+// 'now' if that happened to be an option.
+std::string_view TabComplete(std::string_view partial, std::string_view full_line)
+{
+    if (partial.empty())
+        return "";
+
+    // If we're completing the first token (the command)
+    if (partial.data() == full_line.data())
+    {
+        std::string_view match = "";
+        int matches = 0;
+
+        for (const auto *cmd : g_CommandTable)
+        {
+            if (StringStartsWithInsensitive(cmd->command, partial))
+            {
+                match = cmd->command;
+                matches++;
+            }
+        }
+
+        if (matches == 1)
+            return match.substr(partial.length());
+
+        if (matches > 1)
+        {
+            // Calculate longest common prefix among all matching commands
+            size_t common_len = match.length();
+            for (const auto *cmd : g_CommandTable)
+            {
+                if (StringStartsWithInsensitive(cmd->command, partial))
+                {
+                    size_t j = partial.length();
+                    while (j < common_len && j < strlen(cmd->command) &&
+                           tolower(match[j]) == tolower(cmd->command[j]))
+                        j++;
+                    common_len = j;
+                }
+            }
+            if (common_len > partial.length())
+                return match.substr(partial.length(), common_len - partial.length());
+        }
+    }
+    // If we're completing an argument for 'effect'
+    else if (full_line.substr(0, 6) == "effect")
+    {
+        auto& effectManager = g_ptrSystem->GetEffectManager();
+        auto effects = effectManager.EffectsList();
+        std::string_view firstMatch = "";
+        int matches = 0;
+        size_t common_len = 0;
+
+        for (const auto& effect : effects)
+        {
+            const String& name = effect->FriendlyName();
+            if (StringStartsWithInsensitive(name.c_str(), partial))
+            {
+                if (matches == 0)
+                {
+                    firstMatch = name.c_str();
+                    common_len = firstMatch.length();
+                }
+                else
+                {
+                    size_t j = partial.length();
+                    while (j < common_len && j < (size_t)name.length() &&
+                           tolower(firstMatch[j]) == tolower(name[j]))
+                        j++;
+                    common_len = j;
+                }
+                matches++;
+            }
+        }
+
+        if (matches > 0 && common_len > partial.length())
+            return firstMatch.substr(partial.length(), common_len - partial.length());
+    }
+
+    return "";
+}
+
+
+//
+// Helper: Resolve Effect by index or name
+//
+static std::optional<size_t> ResolveEffect(std::string_view arg)
+{
+    auto& effectManager = g_ptrSystem->GetEffectManager();
+    auto effects = effectManager.EffectsList();
+    if (effects.empty())
+    {
+        cli_printf("Error: No effects loaded.\n");
+        return std::nullopt;
+    }
+
+    // Try as index first
+    size_t val = 0;
+    auto [ptr, ec] = std::from_chars(arg.begin(), arg.end(), val);
+    if (ec == std::errc() && ptr == arg.end())
+    {
+        if (val < effects.size())
+        {
+            return val;
+        }
+        else
+        {
+            cli_printf("Error: Effect index %zu out of range (0-%zu)\n", val, effects.size() - 1);
+            return std::nullopt;
+        }
+    }
+
+    // Try fuzzy name match
+    int match_index = -1;
+    int matches = 0;
+    std::vector<std::string> candidates;
+
+    for (size_t i = 0; i < effects.size(); ++i)
+    {
+        const String& name = effects[i]->FriendlyName();
+        if (ContainsInsensitive(name.c_str(), arg))
+        {
+            match_index = i;
+            matches++;
+            candidates.push_back(name.c_str());
+        }
+    }
+
+    if (matches == 1)
+    {
+        return (size_t)match_index;
+    }
+    else if (matches > 1)
+    {
+        cli_printf("Error: Ambiguous match for '%.*s'. Candidates:\n", (int)arg.length(), arg.data());
+        for (const auto& c : candidates)
+            cli_printf("  %s\n", c.c_str());
+        return std::nullopt;
+    }
+    else
+    {
+        cli_printf("Error: No effect matching '%.*s' found.\n", (int)arg.length(), arg.data());
+        return std::nullopt;
+    }
+}
+
+//
+// Log Verification Command
+//
+static void DoEmitMix(const cli_argv &)
+{
+    debugF("This is a FATAL message");
+    debugE("This is an ERROR message");
+    debugW("This is a WARNING message");
+    debugI("This is an INFO message");
+    debugD("This is a DEBUG message");
+    debugV("This is a VERBOSE message");
+    debugT("This is a TRACE message");
+}
+
+#if USE_MATRIX && ENABLE_WIFI
+static void PrintQuoteField(const char* label, bool hasValue, float value)
+{
+    if (hasValue)
+        cli_printf(", %s %.2f", label, value);
+}
+#endif
+
+static void DoQuotes(const cli_argv &)
+{
+#if USE_MATRIX && ENABLE_WIFI
+    auto effects = g_ptrSystem->GetEffectManager().EffectsList();
+    std::shared_ptr<PatternStocks> stocksEffect = nullptr;
+
+    for (const auto& effect : effects)
+    {
+        if (effect && effect->effectId() == PatternStocks::ID)
+        {
+            stocksEffect = std::static_pointer_cast<PatternStocks>(effect);
+            break;
+        }
+    }
+
+    if (!stocksEffect)
+    {
+        cli_printf("Stocks effect is not loaded.\n");
+        return;
+    }
+
+    cli_printf("Stock server: %s\n", stocksEffect->StockServer().c_str());
+
+    size_t received = 0;
+    stocksEffect->RefreshQuotes([&received](const StockData& quote)
+    {
+        if (quote.symbol.isEmpty())
+        {
+            cli_printf("Quote fetch failed.\n");
+            return;
+        }
+
+        received++;
+        cli_printf("%s: State %s",
+                   quote.symbol.c_str(),
+                   quote.marketState.isEmpty() ? "unknown" : quote.marketState.c_str());
+
+        PrintQuoteField("Open", quote.hasOpen, quote.open);
+        PrintQuoteField("Current", quote.hasCurrentPrice, quote.currentPrice);
+        PrintQuoteField("High", quote.hasHigh, quote.high);
+        PrintQuoteField("Low", quote.hasLow, quote.low);
+        PrintQuoteField("Close", quote.hasClose, quote.close);
+
+        if (quote.hasChange)
+        {
+            if (quote.hasChangePercent)
+                cli_printf(", Change %.2f (%.2f%%)", quote.change, quote.changePercent);
+            else
+                cli_printf(", Change %.2f", quote.change);
+        }
+
+        PrintQuoteField("Prev", quote.hasPreviousClose, quote.previousClose);
+
+        if (quote.hasVolume)
+            cli_printf(", Volume %.0f", quote.volume);
+
+        cli_printf("\n");
+    });
+
+    cli_printf("Quotes refreshed: %zu\n", received);
+#else
+    cli_printf("Stocks effect is not available in this build.\n");
+#endif
+}
+
+//
+// Core Commands Table
+//
+static void DoEffectCommand(const cli_argv &argv)
+{
+    auto& effectManager = g_ptrSystem->GetEffectManager();
+    cli_printf("Current Effect: %s\n", effectManager.GetCurrentEffectName().c_str());
+
+    if (argv.size() > 1)
+    {
+        std::string_view arg = argv[1];
+
+        if (arg == "next")
+        {
+            effectManager.NextEffect();
+        }
+        else if (arg == "prev")
+        {
+            effectManager.PreviousEffect();
+        }
+        else
+        {
+            auto idx = ResolveEffect(arg);
+            if (idx)
+            {
+                effectManager.SetCurrentEffectIndex(*idx);
+            }
+            else
+            {
+                return;
+            }
+        }
+        cli_printf("New Effect: %s\n", effectManager.GetCurrentEffectName().c_str());
+    }
+}
+
+static void DoDirectoryListing(const cli_argv &argv)
+{
+    fs::FS *fileSystem = &SPIFFS;
+
+    fs::File root = fileSystem->open("/");
+
+    fs::File file = root.openNextFile();
+    while (file)
+    {
+        time_t t = file.getLastWrite();
+        struct tm tm = {0};
+        localtime_r(&t, &tm);
+
+        if (file.isDirectory())
+        {
+            cli_printf("%-32s DIR      %d-%02d-%02d %02d:%02d:%02d\n", file.name(), (int)(tm.tm_year + 1900), (int)(tm.tm_mon + 1),
+                       (int)tm.tm_mday, (int)tm.tm_hour, (int)tm.tm_min, (int)tm.tm_sec);
+        }
+        else
+        {
+            cli_printf("%-32s %8zu %d-%02d-%02d %02d:%02d:%02d\n", file.name(), (size_t)file.size(), (int)(tm.tm_year + 1900),
+                       (int)(tm.tm_mon + 1), (int)tm.tm_mday, (int)tm.tm_hour, (int)tm.tm_min, (int)tm.tm_sec);
+        }
+        file = root.openNextFile();
+    }
+}
+
+// Display a file. Hope it's text!
+static void DoCat(const cli_argv &argv)
+{
+    if (argv.size() < 2)
+    {
+        cli_printf("Usage: cat <filename>\n");
+        return;
+    }
+
+    std::string fname(argv[1]);
+    if (fname[0] != '/')
+        fname = "/" + fname;
+
+    fs::FS *fileSystem = &SPIFFS;
+    if (!fileSystem->exists(fname.c_str()))
+    {
+        cli_printf("File not found: %s\n", fname.c_str());
+        return;
+    }
+
+    fs::File file = fileSystem->open(fname.c_str(), "r");
+    if (!file || file.isDirectory())
+    {
+        cli_printf("Error opening file: %s\n", fname.c_str());
+        if (file)
+            file.close();
+        return;
+    }
+
+    char buf[65]; // +1 for null terminator, 64 chars per chunk
+    while (file.available())
+    {
+        size_t len = file.readBytes(buf, sizeof(buf) - 1);
+        buf[len] = 0;
+        cli_printf("%s", buf);
+    }
+    // cli_printf("\n"); // Optional: Ensure newline? Left raw for now.
+
+    file.close();
+}
+
+void DoUptime(const cli_argv &)
+{
+    struct timeval timeval = { 0 };
+    // Microseconds since boot. File wrap bugreport in 292 million years.
+    auto uptime = esp_timer_get_time();
+
+    timeval.tv_sec = uptime / MICROS_PER_SECOND;
+
+    char buf[128];
+    struct tm *tm = gmtime(&timeval.tv_sec);
+    // No, I don't care about leap seconds.
+    strftime(buf, sizeof(buf), "%X", tm);
+    int ndays = timeval.tv_sec / (24 * 60 * 60);
+    cli_printf("Uptime: %d days - %s\n", ndays, buf);
+
+    const char* reason_text = "Unknown";
+    esp_reset_reason_t reason = esp_reset_reason();
+    switch (reason)
+    {
+        case ESP_RST_POWERON: reason_text = "Power On"; break;
+        case ESP_RST_EXT: reason_text = "External Pin"; break;
+        case ESP_RST_SW: reason_text = "Software Restart"; break;
+        case ESP_RST_PANIC: reason_text = "Panic"; break;
+        case ESP_RST_INT_WDT: reason_text = "Watchdog barked"; break;
+        case ESP_RST_TASK_WDT: reason_text = "Task Watchdog barked"; break;
+        case ESP_RST_WDT: reason_text = "Other Watchdog barked"; break;
+        case ESP_RST_DEEPSLEEP: reason_text = "Reset in deep sleep"; break;
+        case ESP_RST_BROWNOUT: reason_text = "Brownout"; break;
+        case ESP_RST_SDIO: reason_text = "Reset over SDIO"; break;
+        // Documented,  but not defined in ESP-IDF esp_system.h (v5.1.0) yet.
+        // case ESP_RST_USB: reason_text = "Reset by USB peripheral"; break;
+        default: reason_text = "Unknown"; break;
+    }
+    cli_printf("Last boot reason: (%d): %s\n", reason, reason_text);
+}
+
+static const command core_commands[] = {
+    {"cat", "Display file content", "Printing file...", DoCat},
+    {"reboot", "Reboot system", "Rebooting. Please stand by...", [](const cli_argv &) { esp_restart(); }},
+    {"clearsettings", "Reset persisted user settings", "Removing persisted settings",
+     [](const cli_argv &) {
+         g_ptrSystem->GetDeviceConfig().RemovePersisted();
+         RemoveEffectManagerConfig(); // Helper from effectmanager.h
+     }},
+    {"tasks", "Display FreeRTOS task list", "Task List:",
+     [](const cli_argv &) {
+#if configUSE_TRACE_FACILITY && configUSE_STATS_FORMATTING_FUNCTIONS
+         char buf[1024];
+         vTaskList(buf);
+         cli_printf("\nName          State      Prio  Stack  Num Core\n%s", buf);
+#else
+         cli_printf("Task list not enabled in FreeRTOS config\n");
+#endif
+     }},
+    {"heap", "Display heap memory info",
+     "Heap usage:", [](const cli_argv &) { heap_caps_print_heap_info(MALLOC_CAP_DEFAULT); }},
+    {"quotes", "Refresh and display stock quotes", "Refreshing quotes...", DoQuotes},
+    {"log", "[tag] <level> Get/set log level", nullptr,
+     [](const cli_argv &argv) {
+         static const struct
+         {
+             const char *name;
+             esp_log_level_t level;
+         } levels[] = {{"none", ESP_LOG_NONE}, {"error", ESP_LOG_ERROR}, {"warn", ESP_LOG_WARN},
+                       {"info", ESP_LOG_INFO}, {"debug", ESP_LOG_DEBUG}, {"verbose", ESP_LOG_VERBOSE}};
+
+         if (argv.size() < 2)
+         {
+             // No args: show the current global log level
+             esp_log_level_t current = esp_log_level_get("*");
+             const char *name = "unknown";
+             for (const auto &l : levels)
+                 if (l.level == current) { name = l.name; break; }
+             cli_printf("Log level: %s\n", name);
+             return;
+         }
+         std::string_view levelStr = argv.back();
+         std::string_view tag = "*";
+         if (argv.size() > 2)
+             tag = argv[1];
+
+         for (const auto &l : levels)
+         {
+             if (StringCompareInsensitive(levelStr, l.name))
+             {
+                 esp_log_level_set(std::string(tag).c_str(), l.level);
+                 cli_printf("Set level for tag '%s' to %d (%s)\n", std::string(tag).c_str(), l.level, l.name);
+                 return;
+             }
+         }
+         cli_printf("Invalid level '%s'. Valid: none error warn info debug verbose\n", std::string(levelStr).c_str());
+     }},
+    {"bright", "[level] Display/Set brightness 0-255", "Brightness:",
+     [](const cli_argv &argv) {
+         if (argv.size() > 1)
+         {
+             int val = atoi(std::string(argv[1]).c_str());
+             g_ptrSystem->GetDeviceConfig().SetBrightness(val);
+         }
+         cli_printf("Brightness: %lu\n", (unsigned long)g_ptrSystem->GetDeviceConfig().GetBrightness());
+     }},
+    {"debug", "emix | log ... Debugging utilities", nullptr,
+     [](const cli_argv &argv) {
+        if (argv.size() > 1 && StringCompareInsensitive(argv[1], "emix")) {
+            DoEmitMix(argv);
+        } else {
+            cli_printf("Usage: debug emix\n");
+        }
+     }},
+    {"ls", "Show filesytem directory", "NAME", DoDirectoryListing},                    // Function pointer
+    {"effect", "[next|prev|name|index] Show/change current effect", "Effects.", DoEffectCommand}, // Function pointer
+    {"simbeat", "[on|off] [bpm] Simulate audio beat", "Simulate Beat:",
+     [](const cli_argv &argv) {
+        if (argv.size() > 1) {
+            if (StringCompareInsensitive(argv[1], "on")) g_Analyzer.SetSimulateBeat(true);
+            else if (StringCompareInsensitive(argv[1], "off")) g_Analyzer.SetSimulateBeat(false);
+            else if (isdigit(argv[1][0])) g_Analyzer.SetSimulateBPM(atoi(std::string(argv[1]).c_str()));
+        }
+        if (argv.size() > 2) {
+             g_Analyzer.SetSimulateBPM(atoi(std::string(argv[2]).c_str()));
+        }
+        cli_printf("SimBeat: %s  BPM: %d\n", g_Analyzer.GetSimulateBeat() ? "ON" : "OFF", g_Analyzer.GetSimulateBPM());
+     }},
+    {"+", "Nudge brightness up", "Brightness +10", [](const cli_argv &) {
+        int val = std::min(255, g_ptrSystem->GetDeviceConfig().GetBrightness() + 10);
+        g_ptrSystem->GetDeviceConfig().SetBrightness(val);
+        cli_printf("Brightness: %d\n", val);
+    }},
+    {"-", "Nudge brightness down", "Brightness -10", [](const cli_argv &) {
+        int val = std::max(0, g_ptrSystem->GetDeviceConfig().GetBrightness() - 10);
+        g_ptrSystem->GetDeviceConfig().SetBrightness(val);
+        cli_printf("Brightness: %d\n", val);
+    }},
+    {"uptime", "Show system uptime", "Showing uptime...", DoUptime},
+    {"color", "[on|off] | [r g b | hex] Set or show colors", "Global Color:",
+     [](const cli_argv &argv) {
+         if (argv.size() > 1)
+         {
+             std::string_view firstArg = argv[1];
+             if (firstArg == "on" || firstArg == "off")
+             {
+                 if (_activeSession)
+                 {
+                     _activeSession->SetShowColors(firstArg == "on");
+                     cli_printf("Log colorization is now %s for this session.\n", _activeSession->ShowColors() ? "enabled" : "disabled");
+                 }
+                 return;
+             }
+
+             CRGB newColor = g_ptrSystem->GetDeviceConfig().GlobalColor();
+             if (argv.size() == 2) // Assume hex if one arg
+             {
+                 std::string hexStr(argv[1]);
+                 if (hexStr[0] == '#') hexStr.erase(0, 1);
+                 uint32_t val = strtol(hexStr.c_str(), nullptr, 16);
+                 newColor = CRGB(val);
+             }
+             else if (argv.size() == 4) // Assume R G B
+             {
+                 newColor.r = atoi(std::string(argv[1]).c_str());
+                 newColor.g = atoi(std::string(argv[2]).c_str());
+                 newColor.b = atoi(std::string(argv[3]).c_str());
+             }
+             g_ptrSystem->GetDeviceConfig().SetGlobalColor(newColor);
+         }
+         CRGB c = g_ptrSystem->GetDeviceConfig().GlobalColor();
+         cli_printf("Global Color: R:%d G:%d B:%d (0x%02X%02X%02X)\n", c.r, c.g, c.b, c.r, c.g, c.b);
+         if (_activeSession)
+         {
+             cli_printf("Log colors: %s\n", _activeSession->ShowColors() ? "ON" : "OFF");
+         }
+     }},
+    {"help", "Display command line options", "Displaying system help",
+     PrintHelp}, // Function pointer logic requires PrintHelp signature match. It does.
+    {"?", "Display command line options", "Displaying system help",
+     PrintHelp}
+};
+
+
+//
+// Helper: cli_printf routes output to the session that originated the current
+// command (_activeSession), falling back to Broadcast if called outside a
+// RunCommand context.
+//
+void cli_printf(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+
+    // Optimized buffer handling: use a 256-byte stack buffer for typical output.
+    // Use heap only for large payloads like 'tasks' or 'network stats'.
+    char stack_buf[256];
+    va_list args_copy;
+    va_copy(args_copy, args);
+    int len = vsnprintf(stack_buf, sizeof(stack_buf), fmt, args_copy);
+    va_end(args_copy);
+
+    if (len < 0)
+    {
+        va_end(args);
+        return;
+    }
+
+    char* buf = stack_buf;
+    bool must_free = false;
+
+    if (static_cast<size_t>(len) >= sizeof(stack_buf))
+    {
+        buf = static_cast<char*>(malloc(len + 1));
+        if (!buf)
+        {
+            va_end(args);
+            return; // OOM: drop output
+        }
+        must_free = true;
+        vsnprintf(buf, len + 1, fmt, args);
+    }
+    va_end(args);
+
+    // Direct output to the session that originated the current command, if any.
+    // This prevents commands run on telnet from also spewing on serial and vice versa.
+    if (_activeSession)
+        _activeSession->WriteText(std::string_view(buf, static_cast<size_t>(len)));
+    else
+        ConsoleManager::Instance().Broadcast(std::string_view(buf, static_cast<size_t>(len)));
+
+    if (must_free)
+        free(buf);
+}
+
+void ProcessCLIByte(uint8_t byte, std::shared_ptr<ConsoleSession> session)
+{
+    if (!session) return;
+    std::string& cmd = session->StringBuffer();
+
+    switch (byte)
+    {
+    case '\t':
+    {
+        size_t lastSpace = cmd.find_last_of(' ');
+        std::string_view partial = (lastSpace == std::string::npos) ? std::string_view(cmd) : std::string_view(cmd).substr(lastSpace + 1);
+        std::string_view suffix = TabComplete(partial, cmd);
+        if (!suffix.empty())
+        {
+            cmd += suffix;
+            cmd += " ";
+            session->WriteRaw(suffix);
+            session->WriteRaw(" ");
+        }
+        break;
+    }
+    case '\b':
+    case 0x7f:
+        if (!cmd.empty())
+        {
+            cmd.pop_back();
+            session->WriteRaw("\b \b");
+        }
+        break;
+
+    case '\r':
+    {
+        // CR triggers command dispatch. Echo the newline so the terminal
+        // moves to the next line before command output appears.
+        session->WriteRaw("\r\n");
+        RunCommand(cmd, session);
+        cmd.clear();
+        break;
+    }
+
+    case '\n':
+        // Swallow bare LF — it's the second byte of a \r\n pair from a
+        // terminal, or a stray newline. The \r already dispatched the command.
+        break;
+
+    default:
+        if (session->EchoEnabled())
+            session->WriteRaw(std::string_view(reinterpret_cast<const char*>(&byte), 1));
+        cmd += (char)byte;
+        break;
+    }
+}
+
+void InitDebugCLI()
+{
+    // Registration
+    RegisterCommands(core_commands);
+
+    // Register the byte handler with ConsoleManager
+    ConsoleManager::Instance().SetByteHandler(ProcessCLIByte);
+}
+
+} // namespace DebugCLI

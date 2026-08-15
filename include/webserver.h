@@ -1,3 +1,5 @@
+#pragma once
+
 //+--------------------------------------------------------------------------
 //
 // File:        webserver.h
@@ -37,25 +39,28 @@
 //              Apr-28-2023         Rbergen     Reduce code duplication
 //---------------------------------------------------------------------------
 
-#pragma once
+#include "globals.h"
 
-#include "deviceconfig.h"
-#include "network.h"
+#if ENABLE_WEBSERVER
 
-#include <Arduino.h>
-#include <ArduinoJson.h>
-#include <AsyncJson.h>
-#include <AsyncTCP.h>
+#include <atomic>
 #include <ESPAsyncWebServer.h>
-#include <FS.h>
-#include <HTTPClient.h>
-#include <SPIFFS.h>
-#include <WiFi.h>
 #include <map>
 
-class CWebServer
+#include "deviceconfig.h"
+#include "iservice.h"
+#include "jsonserializer.h"
+#include "nd_network.h"
+
+class LEDStripEffect;
+
+class CWebServer : public IService
 {
   public:
+    static constexpr int HttpOk = 200;
+    static constexpr int HttpBadRequest = 400;
+    static constexpr int HttpNotFound = 404;
+    static constexpr int HttpInternalServerError = 500;
 
     enum class StatisticsType : uint8_t
     {
@@ -75,7 +80,7 @@ class CWebServer
     using ValueSetter = std::function<bool(Tv)>;
 
     // Value validating function type, as used by DeviceConfig (and possible others)
-    using ValueValidator = std::function<DeviceConfig::ValidateResponse(const String&)>;
+    using ValueValidator = std::function<SuccessResultWithMessage(const String&)>;
 
     // Device stats that don't change after startup
     struct StaticStatistics
@@ -104,18 +109,33 @@ class CWebServer
         }
     };
 
-    static std::vector<SettingSpec, psram_allocator<SettingSpec>> mySettingSpecs;
-    static std::vector<std::reference_wrapper<SettingSpec>> deviceSettingSpecs;
-    static const std::map<String, ValueValidator> settingValidators;
+    std::vector<SettingSpec, psram_allocator<SettingSpec>> _mySettingSpecs;
+    std::vector<std::reference_wrapper<SettingSpec>> _deviceSettingSpecs;
+    String _deviceSettingSpecsJson;
+    // Per-channel pin specs synthesized at first /settings/specs request from
+    // the compiled channel maximum, with stable backing storage for the
+    // const char* fields they hold.
+
+    const std::map<String, ValueValidator> _settingValidators;
 
     AsyncWebServer _server;
     StaticStatistics _staticStats;
+    std::atomic<bool> _running{false};
+
+    // Sticky flag: AsyncWebServer::begin() registers a TCP listener inside
+    // LWIP and AsyncTCP that we cannot fully reset from this fork. Once we
+    // have called begin() the first time we remember it here so a Stop()
+    // followed by Start() can warn loudly rather than silently leak/double-
+    // bind the listening socket. (We still do the begin again because the
+    // AsyncTCP server is normally reused; this just surfaces the limitation.)
+
+    std::atomic<bool> _everStarted{false};
 
     // Helper functions/templates
 
     // Convert param value to a specific type and forward it to a setter function that expects that type as an argument
     template<typename Tv>
-    static bool PushPostParamIfPresent(const AsyncWebServerRequest * pRequest, const String & paramName, ValueSetter<Tv> setter, ParamValueGetter<Tv> getter)
+    bool PushPostParamIfPresent(const AsyncWebServerRequest * pRequest, const String & paramName, ValueSetter<Tv> setter, ParamValueGetter<Tv> getter)
     {
         if (!pRequest->hasParam(paramName, true, false))
             return false;
@@ -129,7 +149,7 @@ class CWebServer
     // Generic param value forwarder. The type argument must be implicitly convertable from String!
     //   Some specializations of this are included in the CPP file
     template<typename Tv>
-    static bool PushPostParamIfPresent(const AsyncWebServerRequest * pRequest, const String & paramName, ValueSetter<Tv> setter)
+    bool PushPostParamIfPresent(const AsyncWebServerRequest * pRequest, const String & paramName, ValueSetter<Tv> setter)
     {
         return PushPostParamIfPresent<Tv>(pRequest, paramName, setter, [](const AsyncWebParameter * param) { return param->value(); });
     }
@@ -138,7 +158,7 @@ class CWebServer
     //
     // Sends a response with CORS headers added
     template<typename Tr>
-    static void AddCORSHeaderAndSendResponse(AsyncWebServerRequest * pRequest, Tr * pResponse)
+    void AddCORSHeaderAndSendResponse(AsyncWebServerRequest * pRequest, Tr * pResponse) const
     {
         pResponse->addHeader("Server","NightDriverStrip");
         pResponse->addHeader("Access-Control-Allow-Origin", "*");
@@ -146,48 +166,62 @@ class CWebServer
     }
 
     // Version for empty response, normally used to finish up things that don't return anything, like "NextEffect"
-    static void AddCORSHeaderAndSendOKResponse(AsyncWebServerRequest * pRequest)
+    void AddCORSHeaderAndSendOKResponse(AsyncWebServerRequest * pRequest) const
     {
-        AddCORSHeaderAndSendResponse(pRequest, pRequest->beginResponse(HTTP_CODE_OK));
+        AddCORSHeaderAndSendResponse(pRequest, pRequest->beginResponse(HttpOk));
     }
 
-    static void AddCORSHeaderAndSendBadRequest(AsyncWebServerRequest * pRequest, const String& message)
+    void AddCORSHeaderAndSendBadRequest(AsyncWebServerRequest * pRequest, const String& message) const
     {
-        AddCORSHeaderAndSendResponse(pRequest, pRequest->beginResponse(HTTP_CODE_BAD_REQUEST, "text/json",
+        AddCORSHeaderAndSendResponse(pRequest, pRequest->beginResponse(HttpBadRequest, "text/json",
             "{\"message\": \"" + message + "\"}"));
     }
 
     // Straightforward support functions
 
-    static void SendBufferOverflowResponse(AsyncWebServerRequest * pRequest);
-    static bool IsPostParamTrue(AsyncWebServerRequest * pRequest, const String & paramName);
-    static const std::vector<std::reference_wrapper<SettingSpec>> & LoadDeviceSettingSpecs();
-    static void SendSettingSpecsResponse(AsyncWebServerRequest * pRequest, const std::vector<std::reference_wrapper<SettingSpec>> & settingSpecs);
-    static void SetSettingsIfPresent(AsyncWebServerRequest * pRequest);
-    static long GetEffectIndexFromParam(AsyncWebServerRequest * pRequest, bool post = false);
-    static bool CheckAndGetSettingsEffect(AsyncWebServerRequest * pRequest, std::shared_ptr<LEDStripEffect> & effect, bool post = false);
-    static void SendEffectSettingsResponse(AsyncWebServerRequest * pRequest, std::shared_ptr<LEDStripEffect> & effect);
-    static bool ApplyEffectSettings(AsyncWebServerRequest * pRequest, std::shared_ptr<LEDStripEffect> & effect);
+    void SendBufferOverflowResponse(AsyncWebServerRequest * pRequest);
+    bool IsPostParamTrue(AsyncWebServerRequest * pRequest, const String & paramName);
+    const std::vector<std::reference_wrapper<SettingSpec>> & LoadDeviceSettingSpecs();
+    bool EnsureDeviceSettingSpecsJson();
+    bool BuildSettingSpecsJson(String& json, const std::vector<std::reference_wrapper<SettingSpec>> & settingSpecs);
+    void SendSettingSpecsResponse(AsyncWebServerRequest * pRequest, const std::vector<std::reference_wrapper<SettingSpec>> & settingSpecs);
+    SuccessResultWithMessage ValidateLegacyDeviceSettings(AsyncWebServerRequest * pRequest);
+    SuccessResultWithMessage SetSettingsIfPresent(AsyncWebServerRequest * pRequest);
+
+    // Apply a new audio input pin to DeviceConfig and, when the build supports
+    // a live reconfigure, push it through AudioService::Reconfigure() without
+    // requiring a reboot. Reverts the persisted pin on failure. Safe to call
+    // whether or not g_ptrSystem / AudioService are present. Returns true if
+    // either the pin was unchanged or the live reconfigure succeeded.
+
+    bool ApplyAudioInputPinChange(int oldPin);
+    long GetEffectIndexFromParam(AsyncWebServerRequest * pRequest, bool post = false);
+    bool CheckAndGetSettingsEffect(AsyncWebServerRequest * pRequest, std::shared_ptr<LEDStripEffect> & effect, bool post = false);
+    void SendEffectSettingsResponse(AsyncWebServerRequest * pRequest, std::shared_ptr<LEDStripEffect> & effect);
+    bool ApplyEffectSettings(AsyncWebServerRequest * pRequest, std::shared_ptr<LEDStripEffect> & effect);
 
     // Endpoint member functions
 
-    static void GetEffectListText(AsyncWebServerRequest * pRequest);
-    static void GetSettingSpecs(AsyncWebServerRequest * pRequest);
-    static void GetSettings(AsyncWebServerRequest * pRequest);
-    static void SetSettings(AsyncWebServerRequest * pRequest);
-    static void GetEffectSettingSpecs(AsyncWebServerRequest * pRequest);
-    static void GetEffectSettings(AsyncWebServerRequest * pRequest);
-    static void SetEffectSettings(AsyncWebServerRequest * pRequest);
-    static void ValidateAndSetSetting(AsyncWebServerRequest * pRequest);
-    static void Reset(AsyncWebServerRequest * pRequest);
-    static void SetCurrentEffectIndex(AsyncWebServerRequest * pRequest);
-    static void EnableEffect(AsyncWebServerRequest * pRequest);
-    static void DisableEffect(AsyncWebServerRequest * pRequest);
-    static void MoveEffect(AsyncWebServerRequest * pRequest);
-    static void CopyEffect(AsyncWebServerRequest * pRequest);
-    static void DeleteEffect(AsyncWebServerRequest * pRequest);
-    static void NextEffect(AsyncWebServerRequest * pRequest);
-    static void PreviousEffect(AsyncWebServerRequest * pRequest);
+    void GetEffectListText(AsyncWebServerRequest * pRequest);
+    void GetSettingSpecs(AsyncWebServerRequest * pRequest);
+    void GetSettings(AsyncWebServerRequest * pRequest);
+    void SetSettings(AsyncWebServerRequest * pRequest);
+    void GetUnifiedSettings(AsyncWebServerRequest * pRequest);
+    void GetUnifiedSettingsSchema(AsyncWebServerRequest * pRequest);
+    void SetUnifiedSettings(AsyncWebServerRequest * pRequest, JsonVariantConst json);
+    void GetEffectSettingSpecs(AsyncWebServerRequest * pRequest);
+    void GetEffectSettings(AsyncWebServerRequest * pRequest);
+    void SetEffectSettings(AsyncWebServerRequest * pRequest);
+    void ValidateAndSetSetting(AsyncWebServerRequest * pRequest);
+    void Reset(AsyncWebServerRequest * pRequest);
+    void SetCurrentEffectIndex(AsyncWebServerRequest * pRequest);
+    void EnableEffect(AsyncWebServerRequest * pRequest);
+    void DisableEffect(AsyncWebServerRequest * pRequest);
+    void MoveEffect(AsyncWebServerRequest * pRequest);
+    void CopyEffect(AsyncWebServerRequest * pRequest);
+    void DeleteEffect(AsyncWebServerRequest * pRequest);
+    void NextEffect(AsyncWebServerRequest * pRequest);
+    void PreviousEffect(AsyncWebServerRequest * pRequest);
 
     // Not static because it uses member _staticStats
     void GetStatistics(AsyncWebServerRequest * pRequest, StatisticsType statsType = StatisticsType::All) const;
@@ -195,30 +229,46 @@ class CWebServer
     // This registers a handler for GET requests for one of the known files embedded in the firmware.
     void ServeEmbeddedFile(const char strUri[], EmbeddedWebFile &file)
     {
-        _server.on(strUri, HTTP_GET, [strUri, file](AsyncWebServerRequest *request)
+        _server.on(strUri, HTTP_GET, [this, strUri, file](AsyncWebServerRequest *request)
         {
-            Serial.printf("GET for: %s\n", strUri);
             AsyncWebServerResponse *response = request->beginResponse(200, file.type, file.contents, file.length);
             if (file.encoding)
             {
                 response->addHeader("Content-Encoding", file.encoding);
             }
+            response->addHeader("Cache-Control", "no-store, max-age=0");
+            response->addHeader("Pragma", "no-cache");
 
-            AddCORSHeaderAndSendResponse(request, response);
+            this->AddCORSHeaderAndSendResponse(request, response);
         });
     }
 
   public:
-    CWebServer()
-        : _server(NetworkPort::Webserver), _staticStats()
-    {}
+        CWebServer();
 
-    // begin - register page load handlers and start serving pages
+    ~CWebServer() override { Stop(); }
+
+    // IService lifecycle. Start delegates to begin() (which registers the
+    // route handlers and calls AsyncWebServer::begin); Stop ends the server.
+    // Idempotent on both sides.
+    bool Start() override;
+    void Stop() override;
+    bool IsRunning() const override   { return _running.load(); }
+    const char* Name() const override { return "WebServer"; }
+
+    // begin - register page load handlers and start serving pages.
+    // Retained for callers that already use the AsyncWebServer-style name;
+    // Start() invokes this internally.
     void begin();
 
     void AddWebSocket(AsyncWebSocket& webSocket)
     {
         _server.addHandler(&webSocket);
+    }
+
+    void RemoveWebSocket(AsyncWebSocket& webSocket)
+    {
+        _server.removeHandler(&webSocket);
     }
 };
 
@@ -239,3 +289,19 @@ inline CWebServer::StatisticsType operator&(CWebServer::StatisticsType lhs, CWeb
 // Set value in lambda using a forwarding function. Reports success based on function's return value,
 //   which must be implicitly convertable to bool
 #define CONFIRM_VALUE(functionCall) [&](auto value)->bool { return functionCall; }
+
+template<>
+bool CWebServer::PushPostParamIfPresent<bool>(const AsyncWebServerRequest * pRequest, const String & paramName, ValueSetter<bool> setter);
+
+template<>
+bool CWebServer::PushPostParamIfPresent<size_t>(const AsyncWebServerRequest * pRequest, const String & paramName, ValueSetter<size_t> setter);
+
+template<>
+bool CWebServer::PushPostParamIfPresent<int>(const AsyncWebServerRequest * pRequest, const String & paramName, ValueSetter<int> setter);
+
+template<>
+bool CWebServer::PushPostParamIfPresent<CRGB>(const AsyncWebServerRequest * pRequest, const String & paramName, ValueSetter<CRGB> setter);
+
+template<>
+void CWebServer::AddCORSHeaderAndSendResponse<AsyncJsonResponse>(AsyncWebServerRequest * pRequest, AsyncJsonResponse * pResponse) const;
+#endif  // ENABLE_WEBSERVER

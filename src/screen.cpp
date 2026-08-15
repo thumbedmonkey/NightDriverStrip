@@ -29,21 +29,50 @@
 //---------------------------------------------------------------------------
 
 #include "globals.h"
-#include "soundanalyzer.h"
-#include "systemcontainer.h"
-#include <algorithm>
-#include "screen.h"
-
-#if defined(TOGGLE_BUTTON_0) || defined(TOGGLE_BUTTON_1)
-#include "Bounce2.h" // For Bounce button class
-#endif
+#include "nd_network.h"
 
 #if USE_SCREEN
+
+// Screen
+//
+// Handles the small OLED or TFT display that is optionally connected to the board.  It's useful for
+// showing the IP address, buffer depth, clock, etc.
+
+#include <algorithm>
+#include <ctime>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 #if USE_TFTSPI
 #include <SPI.h>
 #include <TFT_eSPI.h>
 #endif
+
+#if defined(TOGGLE_BUTTON_0) || defined(TOGGLE_BUTTON_1)
+#include "Bounce2.h"          // For Bounce button class
+#endif
+
+#if USE_M5
+#include <M5Unified.h>
+#endif
+
+#if AMOLED_S3
+#include <lvgl.h>
+#endif
+
+#include "colordata.h"
+#include "effectmanager.h"
+#include "ledbuffer.h"
+#include "ledstripeffect.h"
+#include "screen.h"
+#include "soundanalyzer.h"
+#include "systemcontainer.h"
+#include "taskmgr.h"
+#include "values.h"
 
 #define SHOW_FPS true // Indicates whether little lcd should show FPS
 
@@ -60,7 +89,7 @@ void Page::OnButtonPress(uint8_t buttonIndex)
     if (buttonIndex == 0)
     {
         // Default: advance to the next effect
-        g_ptrSystem->EffectManager().NextEffect();
+        g_ptrSystem->GetEffectManager().NextEffect();
     }
     else if (buttonIndex == 1)
     {
@@ -73,7 +102,7 @@ void Page::OnButtonPress(uint8_t buttonIndex)
 
 class BasicInfoSummaryPage final : public Page
 {
-  public:
+public:
     std::string Name() const override { return "BasicInfoSummary"; }
 
     void OnButtonPress(uint8_t buttonIndex) override
@@ -112,29 +141,43 @@ class BasicInfoSummaryPage final : public Page
         // Second param is background for clean overwrite
         display.setTextColor(display.GetTextColor(), display.GetBkgndColor());
         display.setCursor(xMargin, yMargin);
-        display.println(str_sprintf("%s:%dx%d %c %dK", FLASH_VERSION_NAME, g_ptrSystem->Devices().size(), NUM_LEDS,
-                                    chStatus, ESP.getFreeHeap() / 1024));
+        display.println(str_sprintf("%s:%zu %c %zuk", FLASH_VERSION_NAME, (size_t)g_ptrSystem->GetDevices().size(),
+                                    chStatus, (size_t)(ESP.getFreeHeap() / 1024)));
 
         // WiFi info line 2
         auto lineHeight = display.fontHeight();
         display.setCursor(xMargin + 0, yMargin + lineHeight);
-        if (!WiFi.isConnected())
+        if (!nd_network::IsWiFiConnected())
             display.println("No Wifi");
         else
         {
-            const IPAddress address = WiFi.localIP();
-            display.println(str_sprintf("%ddB:%d.%d.%d.%d", (int)labs(WiFi.RSSI()), address[0], address[1], address[2], address[3]));
+            display.println(str_sprintf("%ddB:%s", abs(nd_network::GetWiFiRSSI()), nd_network::GetWiFiLocalIP().c_str()));
         }
 
         // Buffer Status Line 3
-        auto &bufferManager = g_ptrSystem->BufferManagers()[0];
+        size_t bufferDepth = 0;
+        size_t bufferCount = 0;
+        double oldestAge = 0.0;
+        double newestAge = 0.0;
+        if (g_ptrSystem->HasBufferManagers())
+        {
+            auto &bufferManager = g_ptrSystem->GetBufferManagers()[0];
+            // The display runs on its own task, so even status-only buffer
+            // reads need the producer/consumer mutex to avoid sampling torn
+            // circular-buffer indices.
+            std::lock_guard guard(g_buffer_mutex);
+            bufferDepth = bufferManager.Depth();
+            bufferCount = bufferManager.BufferCount();
+            oldestAge = bufferManager.AgeOfOldestBuffer();
+            newestAge = bufferManager.AgeOfNewestBuffer();
+        }
         display.setCursor(xMargin + 0, yMargin + lineHeight * 4);
-        display.println(str_sprintf("BUFR:%02d/%02d %dfps ", bufferManager.Depth(), bufferManager.BufferCount(), g_Values.FPS));
+        display.println(str_sprintf("BUFR:%02lu/%02lu %lufps ", (unsigned long)bufferDepth, (unsigned long)bufferCount, (unsigned long)g_Values.FPS));
 
         // Data Status Line 4
         display.setCursor(xMargin + 0, yMargin + lineHeight * 2);
-        display.println(str_sprintf("DATA:%+06.2lf-%+06.2lf", std::min(99.99, bufferManager.AgeOfOldestBuffer()),
-                                    std::min(99.99, bufferManager.AgeOfNewestBuffer())));
+        display.println(str_sprintf("DATA:%+06.2lf-%+06.2lf", std::min(99.99, oldestAge),
+                                    std::min(99.99, newestAge)));
 
         // Clock info Line 5
         time_t t;
@@ -150,13 +193,13 @@ class BasicInfoSummaryPage final : public Page
         if (display.height() >= lineHeight * 5 + lineHeight)
         {
             display.setCursor(xMargin + 0, yMargin + lineHeight * 5);
-            display.println(str_sprintf("POWR:%3.0lf%% %4uW\n", g_Values.Brite, g_Values.Watts));
+            display.println(str_sprintf("POWR:%3.0lf%% %4luW\n", g_Values.Brite, (unsigned long)g_Values.Watts));
         }
 
         // PSRAM/CPU Info Line 7 - only if display tall enough
         if (display.height() >= lineHeight * 7)
         {
-            auto &taskManager = g_ptrSystem->TaskManager();
+            auto &taskManager = g_ptrSystem->GetTaskManager();
             display.setCursor(xMargin + 0, yMargin + lineHeight * 6);
             display.println(str_sprintf("CPU: %3.0f%%, %3.0f%%  ", taskManager.GetCPUUsagePercent(0), taskManager.GetCPUUsagePercent(1)));
         }
@@ -167,7 +210,7 @@ class BasicInfoSummaryPage final : public Page
             int top = display.height() - lineHeight;
             int height = lineHeight - 3;
             int width = display.width() - xMargin * 2;
-            float ratio = (float)bufferManager.Depth() / (float)bufferManager.BufferCount();
+            float ratio = bufferCount == 0 ? 0.0f : (float)bufferDepth / (float)bufferCount;
             ratio = std::min(1.0f, ratio);
             int filled = (width - 2) * ratio;
 
@@ -214,7 +257,7 @@ inline bool IsSmallDisplay(const Screen &display)
 // Shared header/footer for effect pages
 class TitlePage : public Page
 {
-  protected:
+protected:
     // Cached content top calculated using the header text size to avoid shifting
     int _contentTop = 0;
     int ContentTop(Screen &display) const
@@ -224,7 +267,7 @@ class TitlePage : public Page
         return _contentTop > 0 ? _contentTop : (display.fontHeight() * 3 + 4);
     }
 
-  public:
+public:
     std::string Name() const override { return "Title"; }
 
     void Draw(Screen &display, bool bRedraw) override
@@ -236,7 +279,7 @@ class TitlePage : public Page
         if (IsSmallDisplay(display))
         {
             const uint16_t backColor = display.IsMonochrome() ? BLACK16 : Screen::to16bit(CRGB(0, 0, 64));
-            static int lasteffect = g_ptrSystem->EffectManager().GetCurrentEffectIndex();
+            static int lasteffect = g_ptrSystem->GetEffectManager().GetCurrentEffectIndex();
             static uint32_t lastFullDraw = 0;
 
             _contentTop = display.fontHeight() + 2;
@@ -245,7 +288,7 @@ class TitlePage : public Page
             if (bRedraw || lastFullDraw == 0 || millis() - lastFullDraw > 1000)
             {
                 lastFullDraw = millis();
-                const int currentEffect = g_ptrSystem->EffectManager().GetCurrentEffectIndex();
+                const int currentEffect = g_ptrSystem->GetEffectManager().GetCurrentEffectIndex();
 
                 if (bRedraw || lasteffect != currentEffect)
                 {
@@ -255,7 +298,7 @@ class TitlePage : public Page
                     // Just show effect name, centered
                     display.setTextSize(1);
                     display.setTextColor(display.GetTextColor(), backColor);
-                    String effectName = g_ptrSystem->EffectManager().GetCurrentEffectName();
+                    String effectName = g_ptrSystem->GetEffectManager().GetCurrentEffectName();
                     auto w = display.textWidth(effectName);
                     display.setCursor((display.width() - w) / 2, 2);
                     display.print(effectName);
@@ -266,11 +309,10 @@ class TitlePage : public Page
 
         // Full header/footer for larger displays
         const uint16_t backColor = display.IsMonochrome() ? BLACK16 : Screen::to16bit(CRGB(0, 0, 64));
-        static int lasteffect = g_ptrSystem->EffectManager().GetCurrentEffectIndex();
-        static String sip = WiFi.localIP().toString();
+        static int lasteffect = g_ptrSystem->GetEffectManager().GetCurrentEffectIndex();
+        static String sip = nd_network::GetWiFiLocalIP();
         static String lastFooter;
         static uint32_t lastFullDraw = 0;
-        static uint32_t lastScreen = millis();
 
         // Pick text size based on width (header size)
         display.setTextSize(display.width() > 160 ? 2 : 1);
@@ -278,18 +320,14 @@ class TitlePage : public Page
         const int topMargin = display.fontHeight() * 3 + 4;
         _contentTop = topMargin;
 
-        // Screen FPS (for display updates)
-        float screenFPS = (millis() - lastScreen) / 1000.0f;
-        if (screenFPS != 0)
-            screenFPS = 1.0f / screenFPS;
-        lastScreen = millis();
+        const float screenFPS = display.GetScreenFPS();
 
         // Redraw header when needed
         if (bRedraw || lastFullDraw == 0 || millis() - lastFullDraw > 1000)
         {
             lastFullDraw = millis();
-            const int currentEffect = g_ptrSystem->EffectManager().GetCurrentEffectIndex();
-            const String currentIP = WiFi.localIP().toString();
+            const int currentEffect = g_ptrSystem->GetEffectManager().GetCurrentEffectIndex();
+            const String currentIP = nd_network::GetWiFiLocalIP();
 
             if (bRedraw || lasteffect != currentEffect || sip != currentIP)
             {
@@ -304,19 +342,21 @@ class TitlePage : public Page
                 // Title lines
                 int yh = 2;
                 display.setTextColor(display.GetBorderColor(), backColor);
-                String sEffect = String("Effect: ") + String(currentEffect + 1) + String("/") + String(g_ptrSystem->EffectManager().EffectCount());
+                const auto effectCount = g_ptrSystem->GetEffectManager().EffectCount();
+                String sEffect = String("Effect: ") + String(effectCount == 0 ? 0 : currentEffect + 1) + String("/") + String(effectCount);
                 auto w = display.textWidth(sEffect);
                 display.setCursor(display.width() / 2 - w / 2, yh);
                 display.print(sEffect.c_str());
                 yh += display.fontHeight();
 
                 display.setTextColor(display.GetTextColor(), backColor);
-                w = display.textWidth(g_ptrSystem->EffectManager().GetCurrentEffectName());
+                String effectName = g_ptrSystem->GetEffectManager().GetCurrentEffectName();
+                w = display.textWidth(effectName);
                 display.setCursor(display.width() / 2 - w / 2, yh);
-                display.print(g_ptrSystem->EffectManager().GetCurrentEffectName());
+                display.print(effectName);
                 yh += display.fontHeight();
 
-                String sIP = WiFi.isConnected() ? currentIP.c_str() : "No Wifi";
+                String sIP = nd_network::IsWiFiConnected() ? currentIP.c_str() : "No Wifi";
                 display.setTextColor(display.GetBorderColor(), backColor);
                 w = display.textWidth(sIP);
                 display.setCursor(display.width() / 2 - w / 2, yh);
@@ -324,9 +364,9 @@ class TitlePage : public Page
             }
 
             // Footer line
-            String footer = str_sprintf(" LED: %2d  Scr: %02d", g_Values.FPS, (int)screenFPS);
+            String footer = str_sprintf(" LED: %2lu  Scr: %02d", (unsigned long)g_Values.FPS, (int)screenFPS);
             #if ENABLE_AUDIO
-                footer = str_sprintf(" LED: %2d  Aud: %2d Ser:%2d Scr: %02d", g_Values.FPS, g_Analyzer.AudioFPS(), g_Analyzer.SerialFPS(), (int)screenFPS);
+                footer = str_sprintf(" LED: %2lu  Aud: %2lu Ser:%2lu Scr: %02d", (unsigned long)g_Values.FPS, (unsigned long)g_Analyzer.AudioFPS(), (unsigned long)g_Analyzer.SerialFPS(), (int)screenFPS);
             #endif
 
             if (footer != lastFooter)
@@ -338,7 +378,9 @@ class TitlePage : public Page
                 int yh = display.height() - display.fontHeight();
                 auto w = display.textWidth(footer);
                 display.setCursor(display.width() / 2 - w / 2, yh);
-                display.print(footer);
+
+                // Trailing spaces in case string got shorter...
+                display.print(footer + "   ");
             }
         }
     }
@@ -346,7 +388,7 @@ class TitlePage : public Page
 
 class CurrentEffectSummaryPage final : public TitlePage
 {
-  public:
+public:
     std::string Name() const override { return "CurrentEffectSummary"; }
 
     void OnButtonPress(uint8_t buttonIndex) override
@@ -354,7 +396,7 @@ class CurrentEffectSummaryPage final : public TitlePage
         if (buttonIndex == 0)
         {
             debugI("Button 1 pressed so advancing to next effect");
-            g_ptrSystem->EffectManager().NextEffect();
+            g_ptrSystem->GetEffectManager().NextEffect();
         }
         else
         {
@@ -408,13 +450,48 @@ class CurrentEffectSummaryPage final : public TitlePage
 
 class EffectSimulatorPage final : public TitlePage
 {
-  public:
+    BaseFrameEventListener frameEventListener;
+    bool bClearCompleted = false;
+    uint32_t _lastEffectDrawMs = 0;
+
+public:
+    EffectSimulatorPage()
+    {
+        g_ptrSystem->GetEffectManager().AddFrameEventListener(frameEventListener);
+    }
+
+    ~EffectSimulatorPage() override
+    {
+        // Symmetry with the constructor: deregister so EffectManager can't
+        // hold a dangling reference if the page is ever destroyed (today
+        // the page is a static singleton so this is belt-and-suspenders, but
+        // the lifecycle contract is now correct should that change).
+
+        if (g_ptrSystem && g_ptrSystem->HasEffectManager())
+            g_ptrSystem->GetEffectManager().RemoveFrameEventListener(frameEventListener);
+    }
+
     std::string Name() const override { return "CurrentEffect"; }
 
     void Draw(Screen &display, bool bRedraw) override
     {
-        // Draw shared header/footer first (will be compact on small displays)
+        if (!bClearCompleted || bRedraw)
+        {
+            display.fillScreen(BLACK16);
+            bClearCompleted = true;
+        }
+
+        // Always update shared header/footer so stats (LED/Aud/Ser/Scr) stay fresh
         TitlePage::Draw(display, bRedraw);
+
+        // If no new effect frame, skip the matrix blit but keep the refreshed footer.
+        // Also mark FPS as touched so the loop-based fallback doesn't overwrite the
+        // effect-driven FPS with the UI refresh cadence.
+        if (!frameEventListener.CheckAndClearNewFrameAvailable())
+        {
+            display.TouchFPS();
+            return;
+        }
 
         // Determine content area between header and footer
         const int headerTop = ContentTop(display);
@@ -423,9 +500,6 @@ class EffectSimulatorPage final : public TitlePage
         const int contentHeight = display.height() - bottomMargin - contentTop;
         const int contentWidth = display.width();
 
-        // Clear content area first
-        if (bRedraw)
-            display.fillRect(0, contentTop, contentWidth, contentHeight, BLACK16);
 
         // Matrix dimensions - handle single-row LED strips by wrapping into a matrix
         int mw = MATRIX_WIDTH;
@@ -460,12 +534,23 @@ class EffectSimulatorPage final : public TitlePage
         const int yOffset = contentTop + (contentHeight - drawHeight) / 2;
 
         // Fetch current graphics buffer
-        auto &effectManager = g_ptrSystem->EffectManager();
-        auto gfx = effectManager.g();
-        if (!gfx || gfx->leds == nullptr)
+        auto &effectManager = g_ptrSystem->GetEffectManager();
+        auto& gfx = effectManager.g();
+        if (gfx.leds == nullptr)
             return;
 
         // Blit: draw each LED as a scale x scale rectangle (direct buffer reads, no per-dest-pixel loop)
+        // Track effect draw cadence and update the screen FPS to reflect actual effect rendering rate
+        uint32_t nowMs = millis();
+        if (_lastEffectDrawMs != 0)
+        {
+            uint32_t dt = nowMs - _lastEffectDrawMs;
+            if (dt > 0)
+            {
+                display.UpdateScreenFPSFromDelta(dt);
+            }
+        }
+        _lastEffectDrawMs = nowMs;
         int ledIndex = 0;
         for (int y = 0; y < mh; ++y)
         {
@@ -476,14 +561,14 @@ class EffectSimulatorPage final : public TitlePage
                 if (MATRIX_HEIGHT == 1) // Single row strip - wrap it
                 {
                     if (ledIndex < MATRIX_WIDTH)
-                        c = gfx->leds[ledIndex];
+                        c = gfx.leds[ledIndex];
                     else
                         c = CRGB::Black; // Padding if we run out of LEDs
                     ledIndex++;
                 }
                 else // Real matrix
                 {
-                    c = gfx->leds[XY(x, y)];
+                    c = gfx.leds[XY(x, y)];
                 }
 
                 uint16_t c16 = display.to16bit(c);
@@ -526,11 +611,68 @@ int Screen::ActivePageCount()
 // FlipToNextPage
 void Screen::FlipToNextPage()
 {
-    std::lock_guard<std::mutex> guard(_screenMutex);
+    std::lock_guard guard(_screenMutex);
 
     // Advance to the next page
     const int activeCount = ActivePageCount();
     g_iCurrentPage = (g_iCurrentPage + 1) % std::max(1, activeCount);
+}
+
+// Some devices, like the OLED, require that you send the whole buffer at once, but others do not.  The default impl is to do nothing.
+
+void Screen::StartFrame()
+{
+}
+
+void Screen::EndFrame()
+{
+}
+
+void Screen::ScreenStatus(const String &strStatus)
+{
+    fillScreen(GetBkgndColor());
+    setTextSize(1);
+    setTextColor(GetTextColor(), GetBkgndColor());
+    auto xh = 10;
+    auto yh = 0;
+    setCursor(xh, yh);
+    print(strStatus);
+}
+
+// fontHeight
+//
+// Returns the height of the current font
+
+int Screen::fontHeight()
+{
+    int16_t x1, y1;
+    uint16_t w, h;
+    getTextBounds(String("W"), 0, 0, &x1, &y1, &w, &h);
+    return h;
+}
+
+// textHeight
+//
+// Returns the height of a string in screen pixels
+
+int Screen::textHeight(const String & str)
+{
+    int16_t x1, y1;
+    uint16_t w, h;
+    getTextBounds(str, 0, 0, &x1, &y1, &w, &h);
+    return h;
+}
+
+// textWidth
+//
+// Returns the width of a string in screen pixels
+
+int Screen::textWidth(const String & str)
+{
+    int16_t x1, y1;
+    uint16_t w, h;
+    getTextBounds(str, 0, 0, &x1, &y1, &w, &h);
+    return w;
 }
 
 // Old free functions replaced by Screen methods below
@@ -539,7 +681,7 @@ void Screen::FlipToNextPage()
 // Draws the OLED/LCD screen with the current stats on connection, buffer, drawing, etc.
 void IRAM_ATTR Screen::Update(bool bRedraw)
 {
-    std::lock_guard<std::mutex> guard(_screenMutex);
+    std::lock_guard guard(_screenMutex);
 
     // Initialize default page on first draw
     static bool s_initialized = false;
@@ -561,21 +703,58 @@ void IRAM_ATTR Screen::Update(bool bRedraw)
     if (g_iCurrentPage >= activeCount)
         g_iCurrentPage = std::max(0, activeCount - 1);
 
+    // Reset per-frame override flag
+    _fpsTouchedThisFrame = false;
+
     StartFrame();
     auto &pages = Pages();
     pages[g_iCurrentPage]->Draw(*this, bRedraw);
     EndFrame();
+
+    // If the active page did not set FPS explicitly, fall back to generic frame cadence
+    static uint32_t s_lastFrameMs = 0;
+    const uint32_t now = millis();
+    if (!_fpsTouchedThisFrame)
+    {
+        if (s_lastFrameMs != 0)
+        {
+            const uint32_t dt = now - s_lastFrameMs;
+            if (dt > 0)
+            {
+                const float inst = 1000.0f / (float)dt;
+                _screenFPS = (_screenFPS * 0.8f) + (inst * 0.2f);
+            }
+        }
+    }
+    s_lastFrameMs = now;
 }
 
-// Screen::RunUpdateLoop
-// Displays statistics on the Heltec's built in OLED board.  If you are using a different board, you would simply get
-// rid of this or modify it to fit a screen you do have.  You could also try serial output, as it's on a low-pri thread
-// it shouldn't disturb the primary cores.
+// ITaskService hooks
+//
+// Start/Stop/IsRunning are inherited final from ITaskService; this class only
+// supplies the task config and the screen update loop body. The page-init
+// quirk (lazy button binding) is preserved verbatim — buttons can't attach
+// until pinModes are stable, which they are by the time Run() executes.
 
-void IRAM_ATTR Screen::RunUpdateLoop()
+ITaskService::TaskConfig Screen::GetTaskConfig() const
 {
-    // debugI(">> ScreenUpdateLoopEntry\n");
+    return TaskConfig {
+        "Screen Loop",
+        SCREEN_STACK_SIZE,
+        SCREEN_PRIORITY,
+        SCREEN_CORE,
+        500    // Stop timeout: loop yields every ~1ms.
+    };
+}
 
+// Screen::Run
+// Displays statistics on the Heltec's built in OLED board.  If you are using
+// a different board, you would simply get rid of this or modify it to fit a
+// screen you do have.  You could also try serial output, as it's on a low-pri
+// thread it shouldn't disturb the primary cores.
+
+void IRAM_ATTR Screen::Run()
+{
     bool bRedraw = true;
     // Lazy init of buttons when loop starts (after hardware/defines are known)
     static bool s_buttonsInited = false;
@@ -594,13 +773,7 @@ void IRAM_ATTR Screen::RunUpdateLoop()
         s_buttonsInited = true;
     }
 
-    // Frame rate timing variables
-    constexpr uint32_t kTargetFPS = 60;
-    constexpr uint32_t kTargetFrameTimeMs = 1000 / kTargetFPS; // 33.33ms for 30fps
-    constexpr uint32_t kMinDelayMs = 1;
-    uint32_t lastFrameTime = millis();
-
-    for (;;)
+    while (!ShouldShutdown())
     {
         uint32_t frameStartTime = millis();
 
@@ -657,37 +830,8 @@ void IRAM_ATTR Screen::RunUpdateLoop()
             delay(1);
         }
         bRedraw = false;
-
-        // Calculate frame rate-based delay for 30fps
-        uint32_t frameProcessingTime = millis() - frameStartTime;
-        uint32_t delayTime = kMinDelayMs; // Start with minimum delay
-
-        if (frameProcessingTime < kTargetFrameTimeMs)
-        {
-            delayTime = kTargetFrameTimeMs - frameProcessingTime;
-        }
-
-        // Ensure minimum delay of 1ms
-        if (delayTime < kMinDelayMs)
-        {
-            delayTime = kMinDelayMs;
-        }
-
-        delay(delayTime);
-        lastFrameTime = millis();
+        delay(1);
     }
 }
 
-// Thin wrapper to preserve the existing FreeRTOS task entry point name while
-// delegating to the new Screen::RunUpdateLoop() method.
-void IRAM_ATTR ScreenUpdateLoopEntry(void *)
-{
-    // Ensure the system and display are available
-    if (g_ptrSystem)
-    {
-        auto &display = g_ptrSystem->Display();
-        display.RunUpdateLoop();
-    }
-}
-
-#endif
+#endif // USE_SCREEN

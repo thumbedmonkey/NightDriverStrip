@@ -1,3 +1,6 @@
+#pragma once
+
+#include "random_utils.h"
 //+--------------------------------------------------------------------------
 //
 // File:        PatternPulse.h
@@ -77,9 +80,9 @@ class PatternPulse : public EffectWithId<PatternPulse>
 
     void Draw() override
     {
-        auto graphics = g();
+        auto& graphics = g();
 
-        graphics->DimAll(245);
+        graphics.DimAll(245);
 
         if (step == -1)
         {
@@ -91,7 +94,7 @@ class PatternPulse : public EffectWithId<PatternPulse>
 
         if (step == 0)
         {
-            graphics->DrawSafeCircle(centerX, centerY, step, graphics->to16bit(graphics->ColorFromCurrentPalette(hue)));
+            graphics.DrawSafeCircle(centerX, centerY, step, graphics.to16bit(graphics.ColorFromCurrentPalette(hue)));
             step++;
         }
         else
@@ -99,12 +102,12 @@ class PatternPulse : public EffectWithId<PatternPulse>
             if (step < maxSteps)
             {
                 // initial pulse
-                graphics->DrawSafeCircle(centerX, centerY, step, graphics->to16bit(ColorFromPalette(RainbowColors_p, hue, pow(fadeRate, step - 2) * 255)));
+                graphics.DrawSafeCircle(centerX, centerY, step, graphics.to16bit(ColorFromPalette(RainbowColors_p, hue, pow(fadeRate, step - 2) * 255)));
 
                 // secondary pulse
                 if (step > 5)
                 {
-                    graphics->DrawSafeCircle(centerX, centerY, step - 3, graphics->to16bit(ColorFromPalette(RainbowColors_p, hue, pow(fadeRate, step - 2) * 255)));
+                    graphics.DrawSafeCircle(centerX, centerY, step - 3, graphics.to16bit(ColorFromPalette(RainbowColors_p, hue, pow(fadeRate, step - 2) * 255)));
                 }
                 step++;
             }
@@ -116,8 +119,20 @@ class PatternPulse : public EffectWithId<PatternPulse>
         // effects.standardNoiseSmearing();
     }
 };
+#if ENABLE_AUDIO
 class PatternPulsar : public BeatEffectBase, public EffectWithId<PatternPulsar> {
   private:
+    static constexpr int kPulseBaseMinSteps = 6;
+    static constexpr int kPulseBaseRandomSteps = 8;
+    static constexpr int kSmallPulseMinSteps = 4;
+    static constexpr int kSmallPulseRandomSteps = 8;
+    static constexpr int kMajorBeatBurstThreshold = 2;
+    static constexpr int kMajorBeatExtraBurstCount = 2;
+    static constexpr int kFadeAmount = 10;
+    static constexpr int kMaxNewStarsPerFrame = 8;
+    static constexpr int kStarChanceRange = 4;
+    static constexpr int kSecondaryPulseLag = 3;
+
     struct PulsePop
     {
       public:
@@ -125,14 +140,52 @@ class PatternPulsar : public BeatEffectBase, public EffectWithId<PatternPulsar> 
         int hue = HUE_RED;
         int centerX = 0;
         int centerY = 0;
-        int maxSteps = random_range(0, 8)+6;
+        int maxSteps = random_range(0, kPulseBaseRandomSteps) + kPulseBaseMinSteps;
         int step = -1;
+
+        PulsePop() = default;
+        explicit PulsePop(int steps) : maxSteps(steps) {}
     };
 
     std::vector<PulsePop> _pops;
 
-    float fadeRate = 0.9;
-    int diff;
+    static constexpr float kFadeRate = 0.9f;
+
+    static constexpr size_t ComputeBurstCount(const BeatInfo& beat)
+    {
+        const float normalizedConfidence = std::clamp(beat.confidence / 1.5f, 0.0f, 1.0f);
+        const float normalizedStrength = std::clamp(beat.strength / 2.5f, 0.0f, 1.0f);
+        const float normalizedBass = std::clamp(beat.bass, 0.0f, 1.0f);
+        const float majorBonus = beat.major ? 0.25f : 0.0f;
+        const float burstScore = std::clamp(
+            normalizedConfidence * 0.40f +
+            normalizedStrength * 0.35f +
+            normalizedBass * 0.15f +
+            majorBonus, 0.0f, 1.0f);
+
+        return 1U + static_cast<size_t>(burstScore >= 0.60f);
+    }
+
+    static constexpr int ComputeMaxSteps(const BeatInfo& beat)
+    {
+        const float normalizedStrength = std::clamp(beat.strength / 2.5f, 0.0f, 1.0f);
+        const int minSteps = beat.major ? 7 : 5;
+        const int maxSteps = beat.major ? 13 : 10;
+        return minSteps + static_cast<int>(normalizedStrength * static_cast<float>(maxSteps - minSteps));
+    }
+
+    void SpawnPulsars(const BeatInfo& beat)
+    {
+        const size_t burstCount = ComputeBurstCount(beat);
+        const int maxSteps = ComputeMaxSteps(beat);
+
+        for (size_t i = 0; i < burstCount; ++i)
+        {
+            PulsePop pop;
+            pop.maxSteps = maxSteps + random_range(0, 3);
+            _pops.push_back(pop);
+        }
+    }
 
   public:
     PatternPulsar() :
@@ -152,34 +205,30 @@ class PatternPulsar : public BeatEffectBase, public EffectWithId<PatternPulsar> 
         return 30;
     }
 
-    virtual void HandleBeat(bool bMajor, float elapsed, float span) override
+    virtual void HandleBeat(bool, float, float) override
     {
-        if (span > 1.5)
-        {
-            for (int i = 0; i < random(2)+2; i ++)
-                _pops.push_back( PulsePop() );
-        }
-        else
-        {
-            PulsePop small;
-            small.maxSteps = random(8)+4;
-            _pops.push_back( small );
-        }
+        // PatternPulsar uses the richer BeatInfo path in OnBeat() rather than
+        // the older HandleBeat(bool, elapsed, span) compatibility adapter.
+    }
 
+    virtual void OnBeat(const BeatInfo& beat) override
+    {
+        if (!beat.major)
+            return;
+
+        SpawnPulsars(beat);
+        _lastBeat = g_Values.AppTime.CurrentTime();
     }
 
     void Draw() override
     {
-        ProcessAudio();
-        fadeAllChannelsToBlackBy(10);
+        fadeAllChannelsToBlackBy(kFadeAmount);
 
-        // Add some sparkle
-
-        const int maxNewStarsPerFrame = 8;
-        for (int i = 0; i < maxNewStarsPerFrame; i++)
-            if (random(4) < g_Analyzer.VURatio())
-                g()->drawPixel(random(MATRIX_WIDTH), random(MATRIX_HEIGHT), RandomSaturatedColor());
-
+        // Keep the light audio-reactive sparkle layer that makes the effect feel alive
+        // between beats, while pulsar creation itself remains strictly beat-driven.
+        for (int i = 0; i < kMaxNewStarsPerFrame; i++)
+            if (random(kStarChanceRange) < g_Analyzer.VURatio())
+                g().drawPixel(random(MATRIX_WIDTH), random(MATRIX_HEIGHT), RandomSaturatedColor());
 
         for (auto pop = _pops.begin(); pop != _pops.end();)
         {
@@ -193,7 +242,7 @@ class PatternPulsar : public BeatEffectBase, public EffectWithId<PatternPulsar> 
 
             if (pop->step == 0)
             {
-                g()->DrawSafeCircle(pop->centerX, pop->centerY, pop->step, g()->to16bit(g()->ColorFromCurrentPalette(pop->hue)));
+                g().DrawSafeCircle(pop->centerX, pop->centerY, pop->step, g().to16bit(g().ColorFromCurrentPalette(pop->hue)));
                 pop->step++;
                 pop++;
             }
@@ -202,11 +251,11 @@ class PatternPulsar : public BeatEffectBase, public EffectWithId<PatternPulsar> 
                 if (pop->step < pop->maxSteps)
                 {
                     // initial pulse
-                    g()->DrawSafeCircle(pop->centerX, pop->centerY, pop->step, g()->to16bit(g()->ColorFromCurrentPalette(pop->hue, pow(fadeRate, pop->step - 1) * 255)));
+                    g().DrawSafeCircle(pop->centerX, pop->centerY, pop->step, g().to16bit(g().ColorFromCurrentPalette(pop->hue, pow(kFadeRate, pop->step - 1) * 255)));
 
                     // secondary pulse
-                    if (pop->step > 3)
-                        g()->DrawSafeCircle(pop->centerX, pop->centerY, pop->step - 3, g()->to16bit(g()->ColorFromCurrentPalette(pop->hue, pow(fadeRate, pop->step - 2) * 255)));
+                    if (pop->step > kSecondaryPulseLag)
+                        g().DrawSafeCircle(pop->centerX, pop->centerY, pop->step - kSecondaryPulseLag, g().to16bit(g().ColorFromCurrentPalette(pop->hue, pow(kFadeRate, pop->step - kSecondaryPulseLag - 1) * 255)));
 
                     // This looks like PDP-11 code to me.  double post-inc for the win!
                     pop++->step++;
@@ -223,4 +272,5 @@ class PatternPulsar : public BeatEffectBase, public EffectWithId<PatternPulsar> 
         // effects.standardNoiseSmearing();
     }
 };
+#endif
 #endif

@@ -1,3 +1,5 @@
+#pragma once
+
 //+--------------------------------------------------------------------------
 //
 // File:        effects.h
@@ -29,7 +31,8 @@
 //              Aug-17-2025         Davepl       Converted to enums
 //
 //---------------------------------------------------------------------------
-#pragma once
+
+#include "globals.h"
 
 using EffectId = uint32_t;
 using FactoryId = uint64_t;
@@ -64,6 +67,7 @@ using FactoryId = uint64_t;
 #define PTY_SPEEDDIVISOR    "sdd"
 #define PTY_DELTAHUE        "dth"
 #define PTY_MIRRORED        "mrd"
+#define PTY_FITLEDCOUNT     "flc"
 #define PTY_EVERYNTH        "ent"
 #define PTY_COLOR           "clr"
 #define PTY_BLEND           "bld"
@@ -84,3 +88,9 @@ using FactoryId = uint64_t;
 #define PTY_IGNOREGLOBALCOLOR   "igc"
 
 #define EFFECTS_CONFIG_FILE "/effects.cfg"
+
+#if EFFECTS_FULLMATRIX
+// Configure the shared TJpg_Decoder output callback before any matrix effect
+// (including the early boot splash) attempts to decode an embedded JPEG.
+void ConfigureMatrixJpegDecoder(uint16_t sourceWidth = 0, uint16_t sourceHeight = 0);
+#endif

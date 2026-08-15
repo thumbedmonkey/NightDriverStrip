@@ -1,3 +1,5 @@
+#pragma once
+
 //+--------------------------------------------------------------------------
 //
 // File:        PatternStocks.h
@@ -36,17 +38,21 @@
 #define PatternStocks_H
 
 #include <Arduino.h>
-#include <gfxfont.h>                // Adafruit GFX font structs
 #include <string.h>
 #include <HTTPClient.h>
-#include <UrlEncode.h>
-#include <ledstripeffect.h>
 #include <ArduinoJson.h>
-#include "systemcontainer.h"
+#include <algorithm>
 #include <chrono>
 #include <thread>
 #include <vector>
 #include <map>
+#include <mutex>
+#include <sstream>
+#include <limits>
+
+#include "formatsize.h"
+#include "gfxfont.h"                // Adafruit GFX font structs
+#include "systemcontainer.h"
 
 extern const GFXfont Apple5x7 PROGMEM;
 using namespace std;
@@ -56,8 +62,10 @@ using namespace std::chrono_literals;
 #define STOCKS_UPDATE_INTERVAL_SECONDS 6s
 #define STOCKS_FETCH_INTERVAL_SECONDS  60s
 
+#ifndef DEFAULT_STOCK_SERVER
 #define DEFAULT_STOCK_SERVER           "davepl.dyndns.org:8888"
-#define DEFAULT_TICKER_SYMBOLS         "AAPL,AMZN,TSLA,MSFT"
+#endif
+#define DEFAULT_TICKER_SYMBOLS         "AAPL,AMZN,TSLA,MSFT,SPCX,INTC"
 
 // AnimatedText
 //
@@ -78,11 +86,13 @@ class AnimatedText
     float animationTime;
     system_clock::time_point startTime;
     const GFXfont * pfont;
+    uint8_t textSize;
 
 
   public:
 
-    AnimatedText(String text, CRGB color, const GFXfont * pfont, float animationTime, int startX, int startY, int endX, int endY)
+    AnimatedText(String text, CRGB color, const GFXfont * pfont, float animationTime,
+                 int startX, int startY, int endX, int endY, uint8_t textSize = 1)
     {
         startTime = system_clock::now();
         this->startX = startX;
@@ -95,6 +105,7 @@ class AnimatedText
         this->currentX = startX;
         this->currentY = startY;
         this->pfont = pfont;
+        this->textSize = textSize;
     }
 
     // UpdatePos
@@ -124,6 +135,7 @@ class AnimatedText
     void Draw(GFXBase *g)
     {
         g->setFont(pfont);
+        g->setTextSize(textSize);
         g->setTextColor(g->to16bit(color));
         g->setCursor(currentX, currentY);
         g->print(text);
@@ -139,7 +151,7 @@ class AnimatedText
 class StockPoint
 {
 public:
-    system_clock::time_point dt;
+    uint32_t epoch = 0;
     float val;
 };
 
@@ -147,26 +159,64 @@ class StockData
 {
 public:
     String symbol;
-    system_clock::time_point timestamp;
+    String marketState;
+    String currentPriceTime;
+    String currentPriceTimeZone;
+    String officialCloseDate;
 
+    float currentPrice = 0.0f;
     float previousClose = 0.0f;
     float open = 0.0f;
     float high = 0.0f;
     float low = 0.0f;
     float close = 0.0f;
+    float officialClose = 0.0f;
+    float regularClose = 0.0f;
+    float change = 0.0f;
+    float changePercent = 0.0f;
     float volume = 0.0f;
 
+    bool hasCurrentPrice = false;
+    bool hasPreviousClose = false;
+    bool hasOpen = false;
+    bool hasHigh = false;
+    bool hasLow = false;
+    bool hasClose = false;
+    bool hasOfficialClose = false;
+    bool hasRegularClose = false;
+    bool hasChange = false;
+    bool hasChangePercent = false;
+    bool hasVolume = false;
+
     vector<StockPoint> points;
+
+    float DisplayPrice() const
+    {
+        if (hasCurrentPrice)
+            return currentPrice;
+        if (hasClose)
+            return close;
+        return hasOfficialClose ? officialClose : 0.0f;
+    }
+
+    float DisplayChange() const
+    {
+        return change;
+    }
 
     String to_string() const
     {
         return "Symbol: " + symbol +
-               " Timestamp: " + timestamp.time_since_epoch().count() +
+               " State: " + marketState +
+               " Current: " + DisplayPrice() +
                " Previous close: " + previousClose +
                " Open: " + open +
                " High: " + high +
                " Low: " + low +
-               " Close: " + close +
+               " Day close: " + close +
+               " Official close: " + officialClose +
+               " Change: " + DisplayChange() +
+               " Change percent: " + changePercent +
                " Volume: " + volume +
                " History: " + points.size() + " points";
     }
@@ -178,10 +228,22 @@ public:
 
 class PatternStocks : public EffectWithId<PatternStocks>
 {
-    AnimatedText textSymbol = AnimatedText("STOCK",  CRGB::White, &Apple5x7,  1.0f, MATRIX_WIDTH, 0,  0, 0);
-    AnimatedText textPrice  = AnimatedText("PRICE",  CRGB::Grey,  &Apple5x7,  1.0f, MATRIX_WIDTH, 8,  0, 8);
-    AnimatedText textChange = AnimatedText("CHANGE", CRGB::White, &Apple5x7,  1.0f, MATRIX_WIDTH, 16, 0, 16);
-    AnimatedText textVolume = AnimatedText("VOLUME", CRGB::Grey,  &Apple5x7,  1.0f, MATRIX_WIDTH, 24, 0, 24);
+    static constexpr uint8_t kTextScale = MATRIX_WIDTH >= 128 ? 2 : 1;
+    static constexpr int kTextRowHeight = 8 * kTextScale;
+    static constexpr int kGraphTop = kTextRowHeight * 2 + 2;
+
+    AnimatedText textSymbol = AnimatedText(
+        "STOCK", CRGB::White, &Apple5x7, 1.0f,
+        MATRIX_WIDTH, kTextRowHeight - 1, 0, kTextRowHeight - 1, kTextScale);
+    AnimatedText textPrice = AnimatedText(
+        "PRICE", CRGB::Grey, &Apple5x7, 1.0f,
+        MATRIX_WIDTH, kTextRowHeight - 1, 0, kTextRowHeight - 1, kTextScale);
+    AnimatedText textChange = AnimatedText(
+        "CHANGE", CRGB::White, &Apple5x7, 1.0f,
+        MATRIX_WIDTH, kTextRowHeight * 2 - 1, 0, kTextRowHeight * 2 - 1, kTextScale);
+    AnimatedText textVolume = AnimatedText(
+        "VOLUME", CRGB::Grey, &Apple5x7, 1.0f,
+        MATRIX_WIDTH, kTextRowHeight * 2 - 1, 0, kTextRowHeight * 2 - 1, kTextScale);
 
 private:
     // This requires a matching INIT_EFFECT_SETTING_SPECS() in effects.cpp or linker errors will ensue
@@ -192,26 +254,205 @@ private:
     String       stockServer = DEFAULT_STOCK_SERVER;
     String       tickerSymbols = DEFAULT_TICKER_SYMBOLS;
 
-    int          iCurrentStock = 0;
+    int          iCurrentStock = -1;
     size_t       lastCount     = SIZE_MAX;
 
     system_clock::time_point lastUpdate;    // Time of last update
     system_clock::time_point nextFetch = system_clock::now();  // Time of last quote pull
 
     std::map<String, StockData> stockData;  // map of stock symbols to quotes
+    mutable std::mutex stockDataMutex;
+    std::mutex quoteFetchMutex;
 
     using StockDataCallback = function<void(const StockData&)>;
 
     HTTPClient http;
 
+    void AddRealtimeQuoteKeyHeader()
+    {
+        const char * realtimeQuoteKey = cszRealtimeQuoteKey;
+        if (realtimeQuoteKey != nullptr && realtimeQuoteKey[0] != '\0')
+            http.addHeader("X-Stockserver-Realtime-Key", realtimeQuoteKey);
+    }
+
+    void NormalizeStockServer()
+    {
+#if MESMERIZER
+        if (stockServer == "davepl.dyndns.org:8888" || stockServer == "localhost:8888" || stockServer == "127.0.0.1:8888")
+            stockServer = DEFAULT_STOCK_SERVER;
+#endif
+    }
+
+    void DrawCompactQuoteDisplay(int screenHeight)
+    {
+        const int topLineHeight = screenHeight / 2;
+
+        StockData currentStock;
+        {
+            std::lock_guard dataGuard(stockDataMutex);
+            if (stockData.empty())
+            {
+                g().DrawTextInBand("STOCKS", 0, topLineHeight, CRGB::White);
+                g().DrawTextInBand("--", topLineHeight, screenHeight - topLineHeight, CRGB::LightGrey);
+                return;
+            }
+
+            const size_t stockIndex = std::min(static_cast<size_t>(std::max(0, iCurrentStock)), stockData.size() - 1);
+            auto it = stockData.begin();
+            std::advance(it, stockIndex);
+            currentStock = it->second;
+        }
+
+        const float displayPrice = currentStock.DisplayPrice();
+        const String priceText = displayPrice >= 10000 ? String(displayPrice, 0) : String(displayPrice, 2);
+        const CRGB priceColor = currentStock.DisplayChange() >= 0.0f ? CRGB::LightGreen : CRGB::Red;
+
+        g().DrawTextInBand(currentStock.symbol, 0, topLineHeight, CRGB::White);
+        g().DrawTextInBand(priceText, topLineHeight, screenHeight - topLineHeight, priceColor);
+    }
+
+    static float JsonFloatOr(JsonVariantConst value, float fallback = 0.0f)
+    {
+        return value.is<float>() || value.is<double>() || value.is<int>() ? value.as<float>() : fallback;
+    }
+
+    static bool JsonHasNumber(JsonVariantConst value)
+    {
+        return value.is<float>() || value.is<double>() || value.is<int>() || value.is<unsigned int>();
+    }
+
+    static String JsonStringOr(JsonVariantConst value, const String& fallback = "")
+    {
+        return value.is<const char*>() ? value.as<String>() : fallback;
+    }
+
+    static std::vector<String> SplitSymbols(const String& symbols)
+    {
+        std::vector<String> tokens;
+        std::istringstream tokenStream(symbols.c_str());
+        std::string token;
+
+        while (std::getline(tokenStream, token, ','))
+        {
+            String symbol(token.c_str());
+            symbol.trim();
+            if (!symbol.isEmpty())
+                tokens.push_back(symbol);
+        }
+
+        return tokens;
+    }
+
+    static bool SymbolListContains(const String& symbols, const String& symbol)
+    {
+        String normalizedSymbol = symbol;
+        normalizedSymbol.trim();
+        normalizedSymbol.toUpperCase();
+
+        for (String candidate : SplitSymbols(symbols))
+        {
+            candidate.toUpperCase();
+            if (candidate == normalizedSymbol)
+                return true;
+        }
+
+        return false;
+    }
+
+    static StockData ParseQuoteV2(JsonDocument& doc)
+    {
+        StockData stockData;
+
+        // Compact HUB75 profile.
+        if (doc["v"].as<int>() == 2)
+        {
+            stockData.symbol               = JsonStringOr(doc["s"]);
+            stockData.marketState          = JsonStringOr(doc["st"]);
+            stockData.currentPrice         = JsonFloatOr(doc["p"]);
+            stockData.hasCurrentPrice      = JsonHasNumber(doc["p"]);
+            stockData.previousClose        = JsonFloatOr(doc["pc"]);
+            stockData.hasPreviousClose     = JsonHasNumber(doc["pc"]);
+            stockData.officialClose        = JsonFloatOr(doc["oc"]);
+            stockData.hasOfficialClose     = JsonHasNumber(doc["oc"]);
+            stockData.officialCloseDate    = JsonStringOr(doc["ocd"]);
+            stockData.hasRegularClose      = JsonHasNumber(doc["rc"]);
+            stockData.regularClose         = JsonFloatOr(doc["rc"]);
+            stockData.change               = JsonFloatOr(doc["chg"]);
+            stockData.hasChange            = JsonHasNumber(doc["chg"]);
+            stockData.changePercent        = JsonFloatOr(doc["chgp"]);
+            stockData.hasChangePercent     = JsonHasNumber(doc["chgp"]);
+            stockData.currentPriceTimeZone = JsonStringOr(doc["tz"]);
+
+            for (JsonArray point : doc["h"].as<JsonArray>())
+            {
+                if (point.size() < 2)
+                    continue;
+
+                StockPoint stockPoint;
+                stockPoint.epoch = point[0].as<uint32_t>();
+                stockPoint.val   = JsonFloatOr(point[1]);
+                stockData.points.push_back(stockPoint);
+            }
+
+            return stockData;
+        }
+
+        // Full v2 profile.
+        if (doc["api_version"].as<int>() == 2)
+        {
+            stockData.symbol               = JsonStringOr(doc["symbol"]);
+            stockData.marketState          = JsonStringOr(doc["market_state"]);
+            stockData.currentPrice         = JsonFloatOr(doc["current_price"]);
+            stockData.hasCurrentPrice      = JsonHasNumber(doc["current_price"]);
+            stockData.currentPriceTime     = JsonStringOr(doc["current_price_time"]);
+            stockData.currentPriceTimeZone = JsonStringOr(doc["current_price_time_zone"]);
+            stockData.previousClose        = JsonFloatOr(doc["previous_close"]);
+            stockData.hasPreviousClose     = JsonHasNumber(doc["previous_close"]);
+            stockData.officialClose        = JsonFloatOr(doc["official_close"]);
+            stockData.hasOfficialClose     = JsonHasNumber(doc["official_close"]);
+            stockData.officialCloseDate    = JsonStringOr(doc["official_close_date"]);
+            stockData.hasRegularClose      = JsonHasNumber(doc["regular_close"]);
+            stockData.regularClose         = JsonFloatOr(doc["regular_close"]);
+            stockData.change               = JsonFloatOr(doc["change"]);
+            stockData.hasChange            = JsonHasNumber(doc["change"]);
+            stockData.changePercent        = JsonFloatOr(doc["change_percent"]);
+            stockData.hasChangePercent     = JsonHasNumber(doc["change_percent"]);
+
+            JsonObjectConst day = doc["day"].as<JsonObjectConst>();
+            stockData.open   = JsonFloatOr(day["open"]);
+            stockData.hasOpen = JsonHasNumber(day["open"]);
+            stockData.high   = JsonFloatOr(day["high"]);
+            stockData.hasHigh = JsonHasNumber(day["high"]);
+            stockData.low    = JsonFloatOr(day["low"]);
+            stockData.hasLow = JsonHasNumber(day["low"]);
+            stockData.close  = JsonFloatOr(day["close"]);
+            stockData.hasClose = JsonHasNumber(day["close"]);
+            stockData.volume = JsonFloatOr(day["volume"]);
+            stockData.hasVolume = JsonHasNumber(day["volume"]);
+
+            JsonArrayConst points = doc["history"]["points"].as<JsonArrayConst>();
+            for (JsonObjectConst point : points)
+            {
+                StockPoint stockPoint;
+                stockPoint.epoch = point["epoch"].as<uint32_t>();
+                stockPoint.val   = JsonFloatOr(point["price"]);
+                stockData.points.push_back(stockPoint);
+            }
+        }
+
+        return stockData;
+    }
+
     void GetQuote(const String &symbol, StockDataCallback callback = nullptr)
     {
-        http.begin("http://" + stockServer + "/?ticker=" + symbol);
+        http.begin("http://" + stockServer + "/?ticker=" + symbol +
+                   "&v=2&points=" + String(MATRIX_WIDTH));
+        AddRealtimeQuoteKeyHeader();
 
         int httpCode = http.GET();
         if (httpCode == HTTP_CODE_OK)
         {
-            debugI("HTTP GET OK");
+            debugD("HTTP GET OK");
             String payload = http.getString(); // Get the response payload
             auto doc = CreateJsonDocument();
             DeserializationError error = deserializeJson(doc, payload);
@@ -219,23 +460,7 @@ private:
 
             if (!error)
             {
-                StockData stockData;
-                stockData.symbol        = doc["symbol"].as<String>();
-                stockData.timestamp     = system_clock::from_time_t(doc["timestamp"].as<time_t>());
-                stockData.previousClose = doc["previous_close"].as<float>();
-                stockData.open          = doc["open"].as<float>();
-                stockData.high          = doc["high"].as<float>();
-                stockData.low           = doc["low"].as<float>();
-                stockData.close         = doc["close"].as<float>();
-                stockData.volume        = doc["volume"].as<float>();
-
-                for (JsonVariant point : doc["points"].as<JsonArray>())
-                {
-                    StockPoint stockPoint;
-                    stockPoint.dt  = system_clock::from_time_t(point["dt"].as<time_t>());
-                    stockPoint.val = point["val"].as<float>();
-                    stockData.points.push_back(stockPoint);
-                }
+                StockData stockData = ParseQuoteV2(doc);
                 if (callback)
                     callback(stockData); // Successful retrieval and parsing
             }
@@ -263,25 +488,9 @@ private:
 
     void GetAllQuotes(const String& symbols, StockDataCallback callback = nullptr)
     {
-        // Lambda to split the symbols string by comma, because somehow this is cooler than strtok() was in 1989
-        // and I want to flex, but also because strtok() is not thread-safe and we're using threads here.  So there.
-        // Also, I'm using std::string here because std::getline() is easier to use with std::string than with String.
+        std::lock_guard fetchGuard(quoteFetchMutex);
 
-        auto split = [](const String& s, char delimiter) -> std::vector<String>
-        {
-            std::vector<String> tokens;
-            std::istringstream tokenStream(s.c_str());
-            std::string token; // Change to std::string to work with std::getline
-
-            while (std::getline(tokenStream, token, delimiter)) {
-                tokens.push_back(String(token.c_str())); // Convert std::string to String when pushing back
-            }
-            return tokens;
-        };
-
-        // Use the lambda to split the symbols string in a vector of strings
-
-        std::vector<String> symbolList = split(symbols, ',');
+        std::vector<String> symbolList = SplitSymbols(symbols);
 
         // And now for each symbol in the list, call GetQuote and save the data in the stockData map
 
@@ -290,7 +499,11 @@ private:
             GetQuote(symbol, [this, callback](const StockData& stockDataReceived)
             {
                 if (!stockDataReceived.symbol.isEmpty())    // Check if the stock data is not empty
-                    this->stockData[stockDataReceived.symbol] = stockDataReceived;
+                {
+                    std::lock_guard dataGuard(stockDataMutex);
+                    if (SymbolListContains(tickerSymbols, stockDataReceived.symbol))
+                        this->stockData[stockDataReceived.symbol] = stockDataReceived;
+                }
                 if (callback)
                     callback(stockDataReceived);            // Optionally, call the callback for each symbol's data
             });
@@ -299,12 +512,15 @@ private:
 
     void FetchQuotes()
     {
-        debugI("Starting update of stocks...");
-        GetAllQuotes(tickerSymbols, [](const StockData& stockDataReceived)
+        String symbols;
         {
-            if (!stockDataReceived.symbol.isEmpty())
-                debugI("Received stock data for %s", stockDataReceived.symbol.c_str());
-            else
+            std::lock_guard dataGuard(stockDataMutex);
+            symbols = tickerSymbols;
+        }
+
+        GetAllQuotes(symbols, [](const StockData& stockDataReceived)
+        {
+            if (stockDataReceived.symbol.isEmpty())
                 debugI("Failed to retrieve stock data");
         });
     }
@@ -335,12 +551,18 @@ private:
         // Lazily load this class' SettingSpec instances if they haven't been already
         if (mySettingSpecs.size() == 0)
         {
-            mySettingSpecs.emplace_back(NAME_OF(stockServer), "Stock server location",
-                                        "The host and port of the service that provides stock data.",
-                                        SettingSpec::SettingType::String);
-            mySettingSpecs.emplace_back(NAME_OF(tickerSymbols), "Ticker symbols",
-                                        "Comma-separated list of ticker symbols to show stock data for.",
-                                        SettingSpec::SettingType::String);
+            mySettingSpecs.push_back(SettingSpec::Validate(SettingSpec{
+                .Name         = NAME_OF(stockServer),
+                .FriendlyName = "Stock server location",
+                .Description  = "The host and port of the service that provides stock data.",
+                .Type         = SettingSpec::SettingType::String
+            }));
+            mySettingSpecs.push_back(SettingSpec::Validate(SettingSpec{
+                .Name         = NAME_OF(tickerSymbols),
+                .FriendlyName = "Ticker symbols",
+                .Description  = "Comma-separated list of ticker symbols for which to retrieve and display stock data.",
+                .Type         = SettingSpec::SettingType::String
+            }));
         }
 
         return &mySettingSpecs;
@@ -356,11 +578,13 @@ public:
             stockServer = jsonObject["sds"].as<String>();
         if (jsonObject["tsl"].is<String>())
             tickerSymbols = jsonObject["tsl"].as<String>();
+
+        NormalizeStockServer();
     }
 
     ~PatternStocks()
     {
-        g_ptrSystem->NetworkReader().CancelReader(readerIndex);
+        g_ptrSystem->GetNetworkReader().CancelReader(readerIndex);
     }
 
     bool SerializeToJSON(JsonObject& jsonObject) override
@@ -371,7 +595,10 @@ public:
         LEDStripEffect::SerializeToJSON(root);
 
         jsonDoc["sds"] = stockServer;
-        jsonDoc["tsl"] = tickerSymbols;
+        {
+            std::lock_guard dataGuard(stockDataMutex);
+            jsonDoc["tsl"] = tickerSymbols;
+        }
 
         return SetIfNotOverflowed(jsonDoc, jsonObject, __PRETTY_FUNCTION__);
     }
@@ -382,14 +609,32 @@ public:
         if (!LEDStripEffect::Init(gfx))
             return false;
 
+        NormalizeStockServer();
+
         // Register a Network Reader task with no interval.  Will manually flag in Draw()
-        readerIndex = g_ptrSystem->NetworkReader().RegisterReader([this] { FetchQuotes(); });
+        readerIndex = g_ptrSystem->GetNetworkReader().RegisterReader([this] { FetchQuotes(); });
 
         // Fire off the stock data reader for an initial download of stock data
         lastUpdate = system_clock::now();
-        g_ptrSystem->NetworkReader().FlagReader(readerIndex);
+        g_ptrSystem->GetNetworkReader().FlagReader(readerIndex);
 
         return true;
+    }
+
+    void RefreshQuotes(const std::function<void(const StockData&)>& callback = nullptr)
+    {
+        String symbols;
+        {
+            std::lock_guard dataGuard(stockDataMutex);
+            symbols = tickerSymbols;
+        }
+
+        GetAllQuotes(symbols, callback);
+    }
+
+    const String& StockServer() const
+    {
+        return stockServer;
     }
 
     // StartQuoteDisplay
@@ -399,23 +644,43 @@ public:
     void StartQuoteDisplay(StockData data)
     {
         // Display the stock data
-        debugI("Displaying stock data for %s", data.symbol.c_str());
+        debugD("Displaying stock data for %s", data.symbol.c_str());
 
-        auto pricetext = data.close >= 10000 ? String(data.close, 0) : String(data.close, 2);
+        const float displayPrice = data.DisplayPrice();
+
+        auto pricetext = displayPrice >= 10000 ? String(displayPrice, 0) : String(displayPrice, 2);
         auto pricelen  = pricetext.length();
-        constexpr auto textwidth = 5;
+        constexpr auto textwidth = 6 * kTextScale;
 
-        auto changetext = String(data.close - data.previousClose, 2);
+        auto changetext = String(data.DisplayChange(), 2);
         auto changelen  = changetext.length();
 
         constexpr auto formatVolumeLargerThan = 1000000;
-        auto voltext = formatSize(data.volume, formatVolumeLargerThan);
+        const double volume = static_cast<double>(data.volume);
+        auto voltext = data.hasVolume && volume >= 0.0 && volume <= static_cast<double>(std::numeric_limits<size_t>::max())
+            ? formatSize(static_cast<size_t>(volume), formatVolumeLargerThan, 0)
+            : String("--");
         auto vollen  = voltext.length();
 
-        textSymbol = AnimatedText(data.symbol, CRGB::White, &Apple5x7, 0.50f, -MATRIX_WIDTH, 8, 0, 8);
-        textPrice  = AnimatedText(pricetext, CRGB::White, &Apple5x7, 0.75f, -MATRIX_WIDTH, 8, MATRIX_WIDTH - pricelen * textwidth, 8);
-        textChange = AnimatedText(changetext, data.close >= data.previousClose ? CRGB::LightGreen : CRGB::Red, &Apple5x7, 1.0f, -MATRIX_WIDTH, 15, MATRIX_WIDTH - changelen * textwidth, 15);
-        textVolume = AnimatedText(voltext, CRGB::LightGrey, &Apple5x7, 1.0f, -MATRIX_WIDTH * 2, 22, MATRIX_WIDTH - vollen * textwidth, 22);
+        const int firstRowBaseline = kTextRowHeight - 1;
+        const int secondRowBaseline = kTextRowHeight * 2 - 1;
+        textSymbol = AnimatedText(
+            data.symbol, CRGB::White, &Apple5x7, 0.50f,
+            -MATRIX_WIDTH, firstRowBaseline, 0, firstRowBaseline, kTextScale);
+        textPrice = AnimatedText(
+            pricetext, CRGB::White, &Apple5x7, 0.75f,
+            -MATRIX_WIDTH, firstRowBaseline,
+            MATRIX_WIDTH - static_cast<int>(pricelen) * textwidth,
+            firstRowBaseline, kTextScale);
+        textChange = AnimatedText(
+            changetext, data.DisplayChange() >= 0.0f ? CRGB::LightGreen : CRGB::Red,
+            &Apple5x7, 1.0f, -MATRIX_WIDTH, secondRowBaseline,
+            0, secondRowBaseline, kTextScale);
+        textVolume = AnimatedText(
+            voltext, CRGB::LightGrey, &Apple5x7, 1.0f,
+            -MATRIX_WIDTH * 2, secondRowBaseline,
+            MATRIX_WIDTH - static_cast<int>(vollen) * textwidth,
+            secondRowBaseline, kTextScale);
     }
 
 
@@ -426,38 +691,49 @@ public:
 
     void UpdateQuoteDisplay()
     {
+        auto& graphics = g();
+
         textSymbol.UpdatePos();
         textPrice.UpdatePos();
         textChange.UpdatePos();
         textVolume.UpdatePos();
 
-        textSymbol.Draw(g().get());
-        textPrice.Draw(g().get());
-        textChange.Draw(g().get());
-        textVolume.Draw(g().get());
+        textSymbol.Draw(&graphics);
+        textPrice.Draw(&graphics);
+        textChange.Draw(&graphics);
+        textVolume.Draw(&graphics);
 
-        if (stockData.empty())
-            return;
+        StockData currentStock;
+        {
+            std::lock_guard dataGuard(stockDataMutex);
+            if (stockData.empty())
+                return;
 
-        auto it = stockData.begin();
-        std::advance(it, iCurrentStock);
-        StockData & currentStock = it->second;
+            if (iCurrentStock < 0 || static_cast<size_t>(iCurrentStock) >= stockData.size())
+                iCurrentStock = 0;
+
+            auto it = stockData.begin();
+            std::advance(it, iCurrentStock);
+            currentStock = it->second;
+        }
 
         // Draw the stock history graph
 
-        int x = 0;
-        int y = 24;
-        int w = MATRIX_WIDTH;
-        int h = MATRIX_HEIGHT - y;
-        int n = std::min((uint)MATRIX_WIDTH, currentStock.points.size());
+        int y = kGraphTop;
+        int h = MATRIX_HEIGHT - y - 1;
+        const size_t pointsToDraw = std::min(static_cast<size_t>(MATRIX_WIDTH), currentStock.points.size());
 
-        if (n > 0)
+        if (pointsToDraw >= 2)
         {
             // We have the high and low data in the stock, but let's not trust it and calculate it ourselves
             // If this works, Davepl wrote it.  If not, Robert made me do it!
 
+            const size_t firstPointIndex = currentStock.points.size() - pointsToDraw;
+            auto firstPoint = currentStock.points.begin() + firstPointIndex;
+            auto lastPoint = currentStock.points.end();
+
             auto [minpoint, maxpoint] =
-                std::minmax_element(currentStock.points.begin(), currentStock.points.end(), [](const StockPoint& a, const StockPoint& b)
+                std::minmax_element(firstPoint, lastPoint, [](const StockPoint& a, const StockPoint& b)
                 {
                         return a.val < b.val;
                 });
@@ -473,19 +749,24 @@ public:
                 float breakeven = currentStock.previousClose;
                 float breakevenY = y + h - (breakeven - min) * scale;
 
-                for (int i = 0; i < n - 1; i++)
+                for (size_t i = 0; i < pointsToDraw - 1; i++)
                 {
-                    float x0 = MATRIX_WIDTH-1-i;
-                    float y0 = y + h - (currentStock.points[i].val - min) * scale;
-                    float x1 = x0;
-                    float y1 = y + h - (currentStock.points[i + 1].val - min) * scale;
+                    const StockPoint& p0 = currentStock.points[firstPointIndex + i];
+                    const StockPoint& p1 = currentStock.points[firstPointIndex + i + 1];
+
+                    float x0 = static_cast<float>(i) * (MATRIX_WIDTH - 1) /
+                               static_cast<float>(pointsToDraw - 1);
+                    float y0 = y + h - (p0.val - min) * scale;
+                    float x1 = static_cast<float>(i + 1) * (MATRIX_WIDTH - 1) /
+                               static_cast<float>(pointsToDraw - 1);
+                    float y1 = y + h - (p1.val - min) * scale;
 
                     // Now draw from bottom up to breakeven in red, and from breakeven to top in green
 
-                    if (currentStock.points[i].val < breakeven)
-                        g()->drawLine(x0, breakevenY, x1, y1, CRGB::Red);
+                    if (p0.val < breakeven)
+                        graphics.drawLine(x0, breakevenY, x1, y1, CRGB::Red);
                     else
-                        g()->drawLine(x0, y0, x1, breakevenY, CRGB::Green);
+                        graphics.drawLine(x0, y0, x1, breakevenY, CRGB::Green);
                 }
             }
         }
@@ -498,18 +779,23 @@ public:
 
     void Draw() override
     {
-        g()->fillScreen(BLACK16);
-        g()->fillRect(0, 0, MATRIX_WIDTH, 9, g()->to16bit(CRGB(0,0,128)));
+        auto& graphics = g();
+        const int screenWidth = static_cast<int>(graphics.GetMatrixWidth());
+        const int screenHeight = static_cast<int>(graphics.GetMatrixHeight());
+
+        graphics.fillScreen(BLACK16);
+        graphics.setFont(&Apple5x7);
+        graphics.setTextWrap(false);
 
         // Periodically refetch the stock data from the server
 
-        if (WiFi.isConnected())
+        if (nd_network::IsWiFiConnected())
         {
             if (system_clock::now() >= nextFetch)
             {
                 nextFetch = system_clock::now() + STOCKS_FETCH_INTERVAL_SECONDS;
                 // Trigger the stock data reader.
-                g_ptrSystem->NetworkReader().FlagReader(readerIndex);
+                g_ptrSystem->GetNetworkReader().FlagReader(readerIndex);
             }
         }
 
@@ -518,26 +804,43 @@ public:
         auto now = system_clock::now();
 
         // We move on to next stock if the interval has passed, or we have less stock data available than before
-        auto showNextStock = now - lastUpdate >= STOCKS_UPDATE_INTERVAL_SECONDS || stockData.size() < lastCount;
-
-        // Only do something if we should and have stock data to show
-        if (showNextStock && !stockData.empty())
+        StockData nextStock;
+        bool hasNextStock = false;
         {
-            lastUpdate = now;
-            lastCount = stockData.size();
+            std::lock_guard dataGuard(stockDataMutex);
+            const size_t stockCount = stockData.size();
+            auto showNextStock = now - lastUpdate >= STOCKS_UPDATE_INTERVAL_SECONDS || stockCount < lastCount;
 
-            if (showNextStock)
+            // Only do something if we should and have stock data to show
+            if (showNextStock && stockCount > 0)
             {
-                iCurrentStock = (iCurrentStock + 1) % stockData.size();
+                lastUpdate = now;
+                lastCount = stockCount;
+
+                if (iCurrentStock < 0 || static_cast<size_t>(iCurrentStock) >= stockCount)
+                    iCurrentStock = 0;
+                else
+                    iCurrentStock = static_cast<int>((static_cast<size_t>(iCurrentStock) + 1) % stockCount);
 
                 auto it = stockData.begin();
                 std::advance(it, iCurrentStock);
-                StartQuoteDisplay(it->second);
+                nextStock = it->second;
+                hasNextStock = true;
             }
         }
 
+        if (hasNextStock)
+            StartQuoteDisplay(nextStock);
+
         // Paint Frame
 
+        if (screenHeight < 32)
+        {
+            DrawCompactQuoteDisplay(screenHeight);
+            return;
+        }
+
+        graphics.fillRect(0, 0, screenWidth, kGraphTop, graphics.to16bit(CRGB(0,0,128)));
         UpdateQuoteDisplay();
     }
 
@@ -550,7 +853,10 @@ public:
         LEDStripEffect::SerializeSettingsToJSON(root);
 
         jsonDoc[NAME_OF(stockServer)] = stockServer;
-        jsonDoc[NAME_OF(tickerSymbols)] = tickerSymbols;
+        {
+            std::lock_guard dataGuard(stockDataMutex);
+            jsonDoc[NAME_OF(tickerSymbols)] = tickerSymbols;
+        }
 
         return SetIfNotOverflowed(jsonDoc, jsonObject, __PRETTY_FUNCTION__);
     }
@@ -558,16 +864,21 @@ public:
     // Extension override to accept our settings on top of those known by LEDStripEffect
     bool SetSetting(const String& name, const String& value) override
     {
-        RETURN_IF_SET(name, NAME_OF(stockServer), stockServer, value);
+        if (FieldAccess::AssignIfSelected(name, NAME_OF(stockServer), stockServer, value))
+            return true;
 
         // If we receive a new list of stock ticker symbols then forget what stock data we
         // have and trigger a reload.
-        if (SetIfSelected(name, NAME_OF(tickerSymbols), tickerSymbols, value))
+        if (name == NAME_OF(tickerSymbols))
         {
-            iCurrentStock = 0;
-            stockData.clear();
-            lastCount = SIZE_MAX;
-            g_ptrSystem->NetworkReader().FlagReader(readerIndex);
+            {
+                std::lock_guard dataGuard(stockDataMutex);
+                tickerSymbols = value;
+                iCurrentStock = -1;
+                stockData.clear();
+                lastCount = SIZE_MAX;
+            }
+            g_ptrSystem->GetNetworkReader().FlagReader(readerIndex);
             return true;
         }
 

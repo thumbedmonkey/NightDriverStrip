@@ -1,3 +1,5 @@
+#pragma once
+
 //+--------------------------------------------------------------------------
 //
 // File:        jsonserializer.h
@@ -29,17 +31,16 @@
 //
 //---------------------------------------------------------------------------
 
-#pragma once
+#include "globals.h"
 
-#include <atomic>
-#include <utility>
 #include <ArduinoJson.h>
+#include <atomic>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <vector>
 
-struct IJSONSerializable
-{
-    virtual bool SerializeToJSON(JsonObject& jsonObject) = 0;
-    virtual bool DeserializeFromJSON(const JsonObjectConst& jsonObject) { return false; }
-};
+#include "itaskservice.h"
 
 template <class E>
 constexpr auto to_value(E e) noexcept
@@ -47,55 +48,9 @@ constexpr auto to_value(E e) noexcept
 	return static_cast<std::underlying_type_t<E>>(e);
 }
 
-#if USE_PSRAM
+JsonDocument CreateJsonDocument();
 
-    struct JsonPsramAllocator : ArduinoJson::Allocator
-    {
-        void* allocate(size_t size) override
-        {
-            return ps_malloc(size);
-        }
-
-        void deallocate(void* pointer) override
-        {
-            free(pointer);
-        }
-
-        void* reallocate(void* ptr, size_t new_size) override {
-            return ps_realloc(ptr, new_size);
-        }
-    };
-
-    inline JsonDocument CreateJsonDocument()
-    {
-        static auto jsonPsramAllocator = JsonPsramAllocator();
-
-        return JsonDocument(&jsonPsramAllocator);
-    }
-
-#else
-
-    inline JsonDocument CreateJsonDocument()
-    {
-        return JsonDocument();
-    }
-
-#endif
-
-inline bool SetIfNotOverflowed(JsonDocument& jsonDoc, JsonObject& jsonObject, const char* location = nullptr)
-{
-    if (jsonDoc.overflowed())
-    {
-        if (location)
-            debugE("JSON document overflowed at: %s", location);
-        else
-            debugE("JSON document overflowed");
-
-        return false;
-    }
-
-    return jsonObject.set(jsonDoc.as<JsonObjectConst>());
-}
+bool SetIfNotOverflowed(JsonDocument& jsonDoc, JsonObject& jsonObject, const char* location = nullptr);
 
 uint32_t toUint32(const CRGB& color);
 
@@ -104,20 +59,9 @@ namespace ArduinoJson
     template <>
     struct Converter<CRGB>
     {
-        static bool toJson(const CRGB& color, JsonVariant dst)
-        {
-            return dst.set(toUint32(color));
-        }
-
-        static CRGB fromJson(JsonVariantConst src)
-        {
-            return CRGB(src.as<uint32_t>());
-        }
-
-        static bool checkJson(JsonVariantConst src)
-        {
-            return src.is<uint32_t>();
-        }
+        static bool toJson(const CRGB& color, JsonVariant dst);
+        static CRGB fromJson(JsonVariantConst src);
+        static bool checkJson(JsonVariantConst src);
     };
 
     inline bool canConvertFromJson(JsonVariantConst src, const CRGB&)
@@ -128,34 +72,9 @@ namespace ArduinoJson
     template <>
     struct Converter<CRGBPalette16>
     {
-        static bool toJson(const CRGBPalette16& palette, JsonVariant dst)
-        {
-            auto doc = CreateJsonDocument();
-
-            JsonArray colors = doc.to<JsonArray>();
-
-            for (auto& color: palette.entries)
-                colors.add(color);
-
-            return dst.set(doc);
-        }
-
-        static CRGBPalette16 fromJson(JsonVariantConst src)
-        {
-            CRGB colors[16];
-            int colorIndex = 0;
-
-            JsonArrayConst componentsArray = src.as<JsonArrayConst>();
-            for (JsonVariantConst value : componentsArray)
-                colors[colorIndex++] = value.as<CRGB>();
-
-            return CRGBPalette16(colors);
-        }
-
-        static bool checkJson(JsonVariantConst src)
-        {
-            return src.is<JsonArrayConst>() && src.as<JsonArrayConst>().size() == 16;
-        }
+        static bool toJson(const CRGBPalette16& palette, JsonVariant dst);
+        static CRGBPalette16 fromJson(JsonVariantConst src);
+        static bool checkJson(JsonVariantConst src);
     };
 
     inline bool canConvertFromJson(JsonVariantConst src, const CRGBPalette16&)
@@ -168,36 +87,110 @@ bool BoolFromText(const String& text);
 bool LoadJSONFile(const String & fileName, JsonDocument& jsonDoc);
 bool SaveToJSONFile(const String & fileName, IJSONSerializable& object);
 bool RemoveJSONFile(const String & fileName);
+std::mutex& JSONFilesystemWriteMutex();
+void WaitForRenderSwapBeforeFilesystemWrite();
+
+namespace FieldAccess
+{
+    // Setting assignment helpers: used by SetSetting(name, value) style paths
+    // where a requested field name selects which destination member to update.
+    template <typename T>
+    bool AssignIfSelected(const String& selectedName, const String& fieldName, T& target, const T& value)
+    {
+        if (selectedName != fieldName)
+            return false;
+
+        target = value;
+        return true;
+    }
+
+    bool AssignIfSelected(const String& selectedName, const String& fieldName, int& target, const String& value);
+    bool AssignIfSelected(const String& selectedName, const String& fieldName, size_t& target, const String& value);
+    bool AssignIfSelected(const String& selectedName, const String& fieldName, float& target, const String& value);
+    bool AssignIfSelected(const String& selectedName, const String& fieldName, bool& target, const String& value);
+    bool AssignIfSelected(const String& selectedName, const String& fieldName, String& target, const String& value);
+    bool AssignIfSelected(const String& selectedName, const String& fieldName, CRGBPalette16& target, const String& value);
+    bool AssignIfSelected(const String& selectedName, const String& fieldName, CRGB& target, const String& value);
+
+    // JSON extraction helpers: used when consuming structured JsonObject payloads.
+    template <typename T>
+    bool AssignIfPresent(JsonObjectConst object, const char* key, T& target)
+    {
+        if (!object[key].is<T>())
+            return false;
+
+        target = object[key].template as<T>();
+        return true;
+    }
+
+    template <typename T>
+    bool AssignIfPresent(JsonObjectConst object, const char* key, std::optional<T>& target)
+    {
+        T value;
+        if (!AssignIfPresent(object, key, value))
+            return false;
+
+        target = value;
+        return true;
+    }
+
+    // Optional apply helpers: used after parse/validate when applying optional
+    // request fields through setters or lambdas.
+    template <typename T, typename Obj, typename Setter>
+    bool ApplyIfPresent(const std::optional<T>& value, Obj& object, Setter setter)
+    {
+        if (!value.has_value())
+            return false;
+
+        (object.*setter)(value.value());
+        return true;
+    }
+
+    template <typename T, typename Fn>
+    bool ApplyIfPresent(const std::optional<T>& value, Fn&& apply)
+    {
+        if (!value.has_value())
+            return false;
+
+        apply(value.value());
+        return true;
+    }
+}
 
 #define JSON_WRITER_DELAY 3000
 
-class JSONWriter
-{
-    // We allow the main JSON Writer task entry point function to access private members
-    friend void IRAM_ATTR JSONWriterTaskEntry(void *);
+// JSONWriter
+//
+// Background SPIFFS writer. Implementers register a write callback once and
+// call FlagWriter / FlushWrites when something has been mutated; the writer
+// task batches flagged writes through JSON_WRITER_DELAY of quiet time so
+// rapid mutations don't thrash the flash. Inherits ITaskService so launch
+// and shutdown discipline are shared with the other task-owning services.
 
+class JSONWriter : public ITaskService
+{
   private:
 
-    // Writer function and flag combo
-    struct WriterEntry
-    {
-        std::atomic_bool flag = false;
-        std::function<void()> writer;
+    struct WriterEntry;
 
-        explicit WriterEntry(std::function<void()> writer) :
-            writer(std::move(writer))
-        {}
+    std::vector<std::shared_ptr<WriterEntry>> writers;
+    mutable std::mutex       writersMutex;
+    std::atomic_ulong        latestFlagMs{0};
+    std::atomic_bool         flushRequested{false};
+    std::atomic_bool         haltWrites{false};
 
-        WriterEntry(WriterEntry&& entry)  noexcept : WriterEntry(entry.writer)
-        {}
-    };
+    // Wakes the writer task from its long ulTaskNotifyTake. Used both by
+    // FlagWriter/FlushWrites (the public API) and by Stop() (via
+    // OnBeforeWaitForStop) to break the task out of its blocking wait.
 
-    std::vector<WriterEntry, psram_allocator<WriterEntry>> writers;
-    std::atomic_ulong        latestFlagMs;
-    std::atomic_bool         flushRequested;
-    std::atomic_bool         haltWrites;
+    void NotifyTask();
 
   public:
+    JSONWriter();
+    ~JSONWriter() override;
+
+    // IService::Name
+    const char* Name() const override { return "JSONWriter"; }
 
     // Add a writer to the collection. Returns the index of the added writer, for use with FlagWriter()
     size_t RegisterWriter(const std::function<void()>& writer);
@@ -207,5 +200,10 @@ class JSONWriter
 
     // Flush pending writes now
     void FlushWrites(bool halt = false);
-};
 
+  protected:
+    // ITaskService hooks
+    TaskConfig GetTaskConfig() const override;
+    void Run() override;
+    void OnBeforeWaitForStop() override;
+};

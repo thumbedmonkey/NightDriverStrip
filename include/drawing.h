@@ -1,3 +1,5 @@
+#pragma once
+
 //+--------------------------------------------------------------------------
 //
 // File:        drawing.h
@@ -22,10 +24,16 @@
 //
 // Description:
 //
-//    Functions exported from Drawing.cpp
+//    Drawing loop declarations.
 //
 // History:     May-11-2021         Davepl      Commented
 //
 //---------------------------------------------------------------------------
 
-void IRAM_ATTR DrawLoopTaskEntry(void *);
+// NOTE: This header is intentionally minimal. The historical free-function
+// drawing entry point (DrawLoopTaskEntry) was migrated into RenderService and
+// is now hosted by ITaskService::Run(). No symbols are currently exported
+// from drawing.cpp; this header is retained as a stable include site for any
+// future drawing-related declarations and to avoid breaking #includes in
+// downstream code. Do not add `#include "globals.h"` here -- pull what you
+// actually need at the call site.

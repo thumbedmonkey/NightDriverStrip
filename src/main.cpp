@@ -154,40 +154,113 @@
 #define FASTLED_ALL_PINS_HARDWARE_SPI
 #define FASTLED_ESP32_SPI_BUS HSPI
 
-#include <ArduinoOTA.h>             // Over-the-air helper object so we can be flashed via WiFi
-#include <nvs_flash.h>                   // Non-volatile storage access
-#include <nvs.h>
-
 #include "globals.h"
-#include "deviceconfig.h"
-#include "systemcontainer.h"
-#include "soundanalyzer.h"
-#include "values.h"
-#include "improvserial.h"                       // ImprovSerial impl for setting WiFi credentials over the serial port
-#include <TJpg_Decoder.h>
+
+#include <algorithm>
+#include <Arduino.h>
+#include <ArduinoOTA.h>
+#if ENABLE_ESPNOW
 #include <esp_now.h>
+#endif
+#include <IPAddress.h>
+#if USE_M5
+#include <M5Unified.h>
+#endif
+#include <memory>
+#include <mutex>
+#include <nvs.h>
+#include <nvs_flash.h>
+#include <SPIFFS.h>
+#include <vector>
+#include <WString.h>
 
 #if defined(TOGGLE_BUTTON_0) || defined(TOGGLE_BUTTON_1)
-  #include "Bounce2.h"                            // For Bounce button class
+#include "Bounce2.h"
+#endif
+#include "audioserialbridge.h"
+#include "audioservice.h"
+#include "colorstreamerservice.h"
+#include "console.h"
+#include "debug_cli.h"
+#include "debugconsole.h"
+#include "deviceconfig.h"
+#include "effectmanager.h"
+#include "gfxbase.h"
+#if USE_HUB75
+#include "hub75gfx.h"
+#endif
+#if USE_M5LCD
+#include "m5tabgfx.h"
+#endif
+#if ENABLE_WIFI
+#include "improvserial.h"
+#endif
+#include "interfaces.h"
+#include "jsonserializer.h"
+#include "ledbuffer.h"
+#include "ledstripeffect.h"
+#include "logger.h"
+#include "nd_network.h"
+#include "ntptimeclient.h"
+#include "remotecontrol.h"
+#include "renderservice.h"
+#include "screen.h"
+#include "socketserver.h"
+#include "soundanalyzer.h"
+#include "systemcontainer.h"
+#include "taskmgr.h"
+#if ENABLE_WEBSERVER
+#include "webserver.h"
 #endif
 
-void IRAM_ATTR ScreenUpdateLoopEntry(void *);
+#if INCOMING_WIFI_ENABLED
+extern "C"
+{
+#include "uzlib/src/uzlib.h"
+}
+#endif
+#include "values.h"
+
+#if ENABLE_OTA
+void SetupOTA(const String &strHostname);
+void ConfirmUpdate();
+#endif
+
+#include "websocketserver.h"
+
+#if USE_STRIP
+    #include "ws281xgfx.h"
+#endif
+
+
+
+// ScreenUpdateLoopEntry was migrated into Screen::Run() (ITaskService).
+
+#if ENABLE_ESPNOW
+#include <esp_arduino_version.h>
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+void onReceiveESPNOW(const esp_now_recv_info_t *recvInfo, const uint8_t *data, int dataLen);
+#else
 void onReceiveESPNOW(const uint8_t *macAddr, const uint8_t *data, int dataLen);
+#endif
+#endif
 
 //
 // Global Variables
 //
 
-std::unique_ptr<SystemContainer> g_ptrSystem;
-Values g_Values;
-RemoteDebug Debug;                                                        // Instance of our telnet debug server
-std::mutex g_buffer_mutex;
+DRAM_ATTR std::unique_ptr<SystemContainer> g_ptrSystem;
+DRAM_ATTR std::mutex g_buffer_mutex;
+DRAM_ATTR std::recursive_mutex g_render_mutex;
+DRAM_ATTR std::recursive_mutex g_effect_manager_mutex;
 
 // The one and only instance of ImprovSerial.  We instantiate it as the type needed
 // for the serial port on this module.  That's usually HardwareSerial but can be
 // other types on the S2, etc... which is why it's a template class.
 
+#if ENABLE_WIFI
 std::unique_ptr<ImprovSerial<typeof(Serial)>> g_pImprovSerial;
+#endif
 
 // If an insulator or tree or fan has multiple rings, this table defines how those rings are laid out such
 // that they add up to FAN_SIZE pixels total per ring.
@@ -195,7 +268,7 @@ std::unique_ptr<ImprovSerial<typeof(Serial)>> g_pImprovSerial;
 // Imagine a setup of 5 Christmas trees, where each tree was made up of 4 concentric rings of decreasing
 // size, like 16, 12, 8, 4.  You would have NUM_FANS of 5 and MAX_RINGS of 4 and your ring table would be 16, 12, 8 4.
 
-const int g_aRingSizeTable[MAX_RINGS] =
+DRAM_ATTR const int g_aRingSizeTable[MAX_RINGS] =
 {
     RING_SIZE_0,
     RING_SIZE_1,
@@ -219,9 +292,9 @@ void PrintOutputHeader()
         debugI("ESP32 PSRAM Init: %s", psramInit() ? "OK" : "FAIL");
     #endif
 
-    debugI("Version %u: Wifi SSID: \"%s\" - ESP32 Free Memory: %u, PSRAM:%u, PSRAM Free: %u",
-            FLASH_VERSION, cszSSID, ESP.getFreeHeap(), ESP.getPsramSize(), ESP.getFreePsram());
-    debugI("ESP32 Clock Freq : %d MHz", ESP.getCpuFreqMHz());
+    debugI("Version %u: Wifi SSID: \"%s\" - ESP32 Free Memory: %zu, PSRAM:%zu, PSRAM Free: %zu",
+            FLASH_VERSION, cszSSID, (size_t)ESP.getFreeHeap(), (size_t)ESP.getPsramSize(), (size_t)ESP.getFreePsram());
+    debugI("ESP32 Clock Freq : %lu MHz", (unsigned long)ESP.getCpuFreqMHz());
 }
 
 // TerminateHandler
@@ -271,39 +344,64 @@ void setup()
     // Initialize Serial output
     Serial.begin(115200);
 
-    // Re-route debug output to the serial port
-    Debug.setSerialEnabled(true);
+    // Route all ESP-IDF log output through ConsoleManager so CRLF translation
+    // and Serial.flush() are applied on every log line.
+    Logger::InstallLogHook();
+    Logger::SetLevel(LogLevel::Info);
 
     // Initialize SPIFFS for file access to non-volatile storage
     if (!SPIFFS.begin(true))
         Serial.println("WARNING: SPIFFS could not be initialized!");
 
-    // Enabling PSRAM allows us to use the extra 4MB of RAM on the ESP32-WROVER chip, but it caused
-    // problems with the S3 rebooting when WiFi connected, so for now, I've limited the default
-    // allocator to be PSRAM only on the MESMERIZER project where it's well tested.
+    // PSRAM-by-default policy
+    //
+    // heap_caps_malloc_extmem_enable(threshold) only affects allocations that
+    // request MALLOC_CAP_DEFAULT (plain malloc / new / String / std::vector).
+    // ESP-IDF already excludes PSRAM from MALLOC_CAP_DMA and MALLOC_CAP_INTERNAL,
+    // so WiFi/lwIP/I2S/SPI DMA paths are unaffected by this setting -- those
+    // subsystems request DMA-capable internal SRAM explicitly and get it.
+    //
+    // Originally limited to MESMERIZER because the S3 + WiFi-connect path was
+    // observed to crash with default-PSRAM enabled. The dynamic-services
+    // refactor reworked the start order and lifetimes that were implicated;
+    // we expect the issue is resolved, but per-environment opt-out remains
+    // possible by setting NO_PSRAM_DEFAULT in build_flags.
 
-    #if MESMERIZER
-        heap_caps_malloc_extmem_enable(96);
+    // Threshold is 96 because that's the value Mesmerizer ran with for years
+    // before this refactor. Dropping it lower panicked on the mesmerizer
+    // build with cache-disabled-region SPI flash crashes:
+    //   - 64 broke EffectManager construction (some object in the 64-95
+    //     byte size range ended up in PSRAM and got touched mid-SPIFFS op)
+    //   - 32 broke wifi_nvs_init / wifi_nvs_validate_sta_listen_interval
+    //     (some WiFi/NVS scratch buffer in the 32-95 byte size range ended
+    //     up in PSRAM and got touched while flash was being read at
+    //     boot-time WiFi setup)
+    // 96 is the proven working value across all LX6+PSRAM boards; raise it
+    // further (e.g. 128, 256) per environment if a board surfaces a similar
+    // issue, but do NOT lower it below 96 without testing every PSRAM env.
+
+    #if USE_PSRAM && !defined(NO_PSRAM_DEFAULT)
+        #ifndef PSRAM_DEFAULT_THRESHOLD
+            #define PSRAM_DEFAULT_THRESHOLD 96
+        #endif
+        heap_caps_malloc_extmem_enable(PSRAM_DEFAULT_THRESHOLD);
+        debugI("PSRAM-default routing enabled at threshold %d bytes", (int)PSRAM_DEFAULT_THRESHOLD);
     #endif
 
     // Initialize LZ library for decompressing compressed wifi packets
+#if INCOMING_WIFI_ENABLED
     uzlib_init();
+#endif
 
     // Create the SystemContainer that holds primary device management objects.
-    g_ptrSystem = make_unique_psram<SystemContainer>();
+    g_ptrSystem = std::make_unique<SystemContainer>();
 
     // Start the Task Manager which takes over the watchdog role and measures CPU usage
     auto& taskManager = g_ptrSystem->SetupTaskManager();
 
-    esp_log_level_set("*", ESP_LOG_WARN);        // set all components to an appropriate logging level
-
     // Display a simple startup header on the serial port
     PrintOutputHeader();
     debugI("Startup!");
-
-    // Start Debug
-    debugI("Starting DebugLoopTaskEntry");
-    taskManager.StartDebugThread();
 
     // Initialize Non-Volatile Storage
     esp_err_t err = nvs_flash_init();
@@ -318,36 +416,35 @@ void setup()
     ESP_ERROR_CHECK(err);
 
     #if ENABLE_ESPNOW
-        WiFi.mode(WIFI_STA);  // or WIFI_AP if applicable
-
+        nd_network::SetWiFiModeSTA();
         if (esp_now_init() != ESP_OK)
             throw std::runtime_error("Error initializing ESP-NOW");
         // Register receive callback function
         esp_now_register_recv_cb(onReceiveESPNOW);
-        debugI("ESP-NOW initialized with MAC address: %s", WiFi.macAddress().c_str());
+        debugI("ESP-NOW initialized with MAC address: %s", nd_network::GetMacAddress(":").c_str());
     #endif
 
     #if ENABLE_WIFI
-        String WiFi_ssid;
-        String WiFi_password;
-        bool ct_creds_selected = false;
+    String WiFi_ssid;
+    String WiFi_password;
+    bool ct_creds_selected = false;
 
-        // if we have valid compile-time creds and they differ from what was persisted as
-        // compile-time creds, adopt them as the new WiFi creds reality.
-        if (cszSSID && strlen(cszSSID) > 0 && cszPassword)
+    // if we have valid compile-time creds and they differ from what was persisted as
+    // compile-time creds, adopt them as the new WiFi creds reality.
+    if (cszSSID && strlen(cszSSID) > 0 && cszPassword)
+    {
+        String ct_ssid;
+        String ct_password;
+        if (!ReadWiFiConfig(WifiCredSource::CompileTimeCreds, ct_ssid, ct_password) || ct_ssid != cszSSID ||
+            ct_password != cszPassword)
         {
-            String ct_ssid;
-            String ct_password;
-            if (!ReadWiFiConfig(WifiCredSource::CompileTimeCreds, ct_ssid, ct_password)
-                || ct_ssid != cszSSID || ct_password != cszPassword)
-            {
-                debugI("Compile-time WiFi credentials differ from stored credentials, adopting new credentials");
-                ct_creds_selected = true;
+            debugI("Compile-time WiFi credentials differ from stored credentials, adopting new credentials");
+            ct_creds_selected = true;
 
-                // Clear any Improv creds as they are now stale
-                if (!ClearWiFiConfig(WifiCredSource::ImprovCreds))
-                    debugW("Failed clearing Improv WiFi config from NVS");
-            }
+            // Clear any Improv creds as they are now stale
+            if (!ClearWiFiConfig(WifiCredSource::ImprovCreds))
+                debugW("Failed clearing Improv WiFi config from NVS");
+        }
         }
 
         // If we didn't decide to use current compile-time credentials, then try to fetch Improv creds
@@ -381,12 +478,24 @@ void setup()
             String family = "ESP32";
         #endif
 
+#if ENABLE_WIFI
         debugW("Starting ImprovSerial for %s", family.c_str());
-        String name = "NDESP32" + get_mac_address().substring(6);
-        g_pImprovSerial = make_unique_psram<ImprovSerial<typeof(Serial)>>();
-        g_pImprovSerial->setup(PROJECT_NAME, FLASH_VERSION_NAME, family, name.c_str(), &Serial);
+        String name = "NDESP32" + nd_network::GetMacAddress().substring(6);
 
-    #endif
+        // Build stamp surfaces in Improv's GET_DEVICE_INFO response so the
+        // WebInstaller dialog can display exactly which firmware is running.
+        // Updated automatically every compile via __DATE__ / __TIME__.
+        static const String improv_version = String(FLASH_VERSION_NAME) + " (" + __DATE__ + " " + __TIME__ + ")";
+
+        g_pImprovSerial = std::make_unique<ImprovSerial<typeof(Serial)>>();
+        g_pImprovSerial->setup(PROJECT_NAME, improv_version, family, name.c_str(), &Serial);
+
+        // Improv will feed unknown bytes to the Serial session's CLI processor
+        g_pImprovSerial->set_on_unknown_byte([](uint8_t byte) {
+            DebugCLI::ProcessCLIByte(byte, ConsoleManager::Instance().GetSerialSession());
+        });
+#endif
+#endif
 
     // Setup config objects
     g_ptrSystem->SetupConfig();
@@ -399,33 +508,43 @@ void setup()
 
         #if ENABLE_NTP
             // Register a network reader to update the device clock at regular intervals
-            networkReader.RegisterReader(UpdateNTPTime, (NTP_DELAY_ERROR_SECONDS) * 1000UL);
+            networkReader.RegisterReader(nd_network::UpdateNTPTime, (NTP_DELAY_ERROR_SECONDS) * 1000UL);
         #endif
     #endif
 
     #if INCOMING_WIFI_ENABLED
-        g_ptrSystem->SetupSocketServer(NetworkPort::IncomingWiFi, NUM_LEDS);  // $C000 is free RAM on the C64, fwiw!
+        g_ptrSystem->SetupSocketServer(NetworkPort::IncomingWiFi, g_ptrSystem->GetDeviceConfig().GetActiveLEDCount());  // $C000 is free RAM on the C64, fwiw!
     #endif
 
     #if ENABLE_WIFI && ENABLE_WEBSERVER
         g_ptrSystem->SetupWebServer();
 
         #if WEB_SOCKETS_ANY_ENABLED
-            g_ptrSystem->SetupWebSocketServer(g_ptrSystem->WebServer());
+            g_ptrSystem->SetupWebSocketServer(g_ptrSystem->GetWebServer());
         #endif
     #endif
 
     // If we have a remote control enabled, set the direction on its input pin accordingly
 
     #if ENABLE_REMOTE
+    if (IR_REMOTE_PIN >= 0)
+    {
         pinMode(IR_REMOTE_PIN, INPUT);
         g_ptrSystem->SetupRemoteControl();
+    }
     #endif
 
     #if ENABLE_AUDIO
     {
-        #if INPUT_PIN
-            pinMode(INPUT_PIN, INPUT);
+        // USE_M5 implies we are using M5Unified which manages the mic pins itself, so we
+        // skip manual pin setup in that case.  For other boards, we set the audio input pin
+        // according to the current config, which allows the boot-applied pin to match what
+        // settings report and for settings changes to take effect immediately.
+
+        #if !USE_M5
+        const auto audioInputPin = g_ptrSystem->GetConfiguredAudioInputPin();
+        if (audioInputPin >= 0)
+            pinMode(audioInputPin, INPUT);
         #endif
         #if TTGO
             pinMode(37, OUTPUT);            // This pin layout allows for mounting a MAX4466 to the backside
@@ -439,63 +558,85 @@ void setup()
     // TOGGLE_BUTTON_0/1 are configured inside Screen's update loop
 
     #if AMOLED_S3
-        #include "amoled/LilyGo_AMOLED.h"
         debugW("Creating AMOLED Screen");
-        g_ptrSystem->SetupDisplay<AMOLEDScreen>(TFT_HEIGHT, TFT_WIDTH);
+        g_ptrSystem->SetupHardwareDisplay(TFT_HEIGHT, TFT_WIDTH);
     #endif
 
     #if USE_TFTSPI
         // Height and width get reversed here because the display is actually portrait, not landscape.  Once
         // we set the rotation, it works as expected in landscape.
         debugW("Creating TFT Screen");
-        g_ptrSystem->SetupDisplay<TFTScreen>(TFT_HEIGHT, TFT_WIDTH);
+        g_ptrSystem->SetupHardwareDisplay(TFT_HEIGHT, TFT_WIDTH);
 
     #elif USE_LCD
 
         debugW("Creating LCD Screen");
-        g_ptrSystem->SetupDisplay<LCDScreen>(TFT_HEIGHT, TFT_WIDTH);
+        g_ptrSystem->SetupHardwareDisplay(TFT_HEIGHT, TFT_WIDTH);
+
+    #elif M5TAB
+
+        auto m5Config = M5.config();
+        M5.begin(m5Config);
+        M5.Display.setRotation(1);
+        #if ENABLE_WIFI
+            // Tab5 hosts WiFi on its ESP32-C6 coprocessor over SDIO. The
+            // Arduino framework defaults do not match the Tab5 wiring, so
+            // configure the board's SDIO bus before the first WiFi call.
+            WiFi.setPins(GPIO_NUM_12, GPIO_NUM_13, GPIO_NUM_11, GPIO_NUM_10,
+                         GPIO_NUM_9, GPIO_NUM_8, GPIO_NUM_15);
+        #endif
 
     #elif USE_M5
 
         M5.begin();
-        M5.Display.startWrite();
-        M5.Display.setRotation(1);
-        M5.Display.setTextDatum(top_center);
-        M5.Display.setTextColor(WHITE);
+        // M5Unified boots the panel in portrait. Set landscape before we size the Screen wrapper so
+        // the screen task and layout code agree on width/height from the start.
+        M5.Lcd.setRotation(1);
+        g_ptrSystem->SetupHardwareDisplay(M5.Lcd.width(), M5.Lcd.height());
 
-        g_ptrSystem->SetupDisplay<M5Screen>(M5.Lcd.width(), M5.Lcd.height());
+        #if M5STICKS3 && ENABLE_REMOTE
+            // The StickS3's AW8737 audio amp emits enough EMI to swamp the
+            // built-in IR receiver on G42. M5Stack's own IR-NEC sample
+            // documents the requirement: "When using the IR receive function,
+            // the SPK amplifier must be turned off; otherwise, reception will
+            // not work properly." NightDriver doesn't currently route audio
+            // out through this speaker, so leaving the amp off is harmless.
+            M5.Speaker.end();
+        #endif
 
     #elif ELECROW
 
             debugW("Creating Elecrow Screen");
-            g_ptrSystem->SetupDisplay<ElecrowScreen>(TFT_HEIGHT, TFT_WIDTH);
+            g_ptrSystem->SetupHardwareDisplay(TFT_HEIGHT, TFT_WIDTH);
 
     #elif USE_OLED
 
         #if USE_SSD1306
             debugW("Creating SSD1306 Screen");
-            g_ptrSystem->SetupDisplay<SSD1306Screen>(128, 64);
+            g_ptrSystem->SetupHardwareDisplay(128, 64);
         #else
         debugW("Creating OLED Screen");
-            g_ptrSystem->SetupDisplay<OLEDScreen>(128, 64);
+            g_ptrSystem->SetupHardwareDisplay(128, 64);
         #endif
 
     #endif
 
     // Create the vector with devices (channels)
     g_ptrSystem->SetupDevices();
-    auto& devices = g_ptrSystem->Devices();
+    auto& devices = g_ptrSystem->GetDevices();
 
     // Initialize the strand controllers depending on how many channels we have
 
-    #if USE_HUB75
+    #if USE_M5LCD
+        M5TabGFX::InitializeHardware(devices);
+    #elif USE_HUB75
         // HUB75GFX is used for HUB75 projects like the Mesmerizer
         HUB75GFX::InitializeHardware(devices);
     #elif HEXAGON
         // Hexagon is for a PCB wtih 271 LEDss arranged in the face of a hexagon
         HexagonGFX::InitializeHardware(devices);
-    #elif USE_WS281X
-        // WS281xGFX is used for simple strips or for matrices woven from strips
+    #elif USE_STRIP
+        // WS281xGFX owns the CRGB framebuffers for strip outputs.
         WS281xGFX::InitializeHardware(devices);
     #endif
 
@@ -505,53 +646,134 @@ void setup()
     // Onboard PWM LED
 
     #if ONBOARD_LED_R
-        ledcAttachPin(ONBOARD_LED_R,  1);   // assign RGB led pins to PWM channels
-        ledcAttachPin(ONBOARD_LED_G,  2);
-        ledcAttachPin(ONBOARD_LED_B,  3);
-        ledcSetup(1, 12000, 8);             // 12 kHz PWM, 8-bit resolution
-        ledcSetup(2, 12000, 8);
-        ledcSetup(3, 12000, 8);
+	#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+	    ledcAttach(ONBOARD_LED_R, 12000, 8); //
+	    ledcAttach(ONBOARD_LED_G, 12000, 8); //
+	    ledcAttach(ONBOARD_LED_B, 12000, 8); //
+        #else
+	    ledcAttachPin(ONBOARD_LED_R,  1);    // assign RGB led pins to PWM channels
+	    ledcAttachPin(ONBOARD_LED_G,  2);
+	    ledcAttachPin(ONBOARD_LED_B,  3);
+	    ledcSetup(1, 12000, 8);              // 12 kHz PWM, 8-bit resolution
+	    ledcSetup(2, 12000, 8);
+	    ledcSetup(3, 12000, 8);
+        #endif
     #endif
 
-    g_ptrSystem->SetupBufferManagers();
-
-    TJpgDec.setJpgScale(1);
-    TJpgDec.setCallback([](int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap)
-    {
-        auto pgfx = g_ptrSystem->EffectManager().g();
-        pgfx->drawRGBBitmap(x, y, bitmap, w, h);
-        return true;
-    });
+    // Network LED frame buffers are sizeable and serve no purpose in a
+    // local-effects-only build. In particular, omitting two 64x32 buffers
+    // gives the no-PSRAM DEVKIT enough internal RAM to launch its renderer.
+    #if INCOMING_WIFI_ENABLED
+        g_ptrSystem->SetupBufferManagers();
+    #endif
 
     // Show splash effect on matrix
-    #if USE_HUB75
+    #if USE_HUB75 || USE_M5LCD
         debugI("Initializing splash effect manager...");
         InitSplashEffectManager();
+
+        // The normal render service is intentionally started only after the
+        // full effect manager has been loaded.  Render one splash frame here
+        // so the panel has immediate visual feedback while effects, WiFi, and
+        // the remaining services initialize.  Without this synchronous draw,
+        // InitEffectsManager() replaces the temporary splash effect before a
+        // render task ever gets a chance to display it.
+
+        auto& splashManager  = g_ptrSystem->GetEffectManager();
+        auto& splashGraphics = splashManager.g();
+        splashManager.StartEffect();
+        splashGraphics.PrepareFrame();
+        splashManager.Update();
+        splashGraphics.PostProcessFrame(splashGraphics.GetLEDCount(), 0);
+
     #endif
 
     InitEffectsManager();
 
-    // Start things that do not depend on the network
-
-    taskManager.StartDrawThread();
-    taskManager.StartScreenThread();
-    taskManager.StartAudioThread();
-    taskManager.StartRemoteThread();
-
     #if ENABLE_WIFI
         debugI("Making initial attempt to connect to WiFi.");
-        ConnectToWiFi(WiFi_ssid, WiFi_password);
-        Debug.setSerialEnabled(true);
+        auto connectResult = nd_network::ConnectToWiFi(WiFi_ssid, WiFi_password);
+        #if WAIT_FOR_WIFI
+            constexpr unsigned long kInitialWiFiConnectTimeoutMs = 30000;
+            constexpr unsigned long kInitialWiFiConnectPollMs    = 250;
+
+            const unsigned long firstConnectStart = millis();
+            while (connectResult == nd_network::WiFiConnectResult::Disconnected &&
+                   millis() - firstConnectStart < kInitialWiFiConnectTimeoutMs)
+            {
+                delay(kInitialWiFiConnectPollMs);
+                connectResult = nd_network::ConnectToWiFi();
+            }
+        #else
+            (void)connectResult;
+        #endif
+    #endif
+
+    #if ENABLE_WIFI && ENABLE_WEBSERVER
+        // With WAIT_FOR_WIFI=0, the first WiFi attempt is intentionally
+        // non-blocking. Only bind AsyncTCP here if the station already has an
+        // IP; otherwise NetworkReader will start these services after connect.
+        if (nd_network::IsWiFiConnected() && g_ptrSystem->HasWebServer())
+            g_ptrSystem->GetWebServer().Start();
+
+        #if WEB_SOCKETS_ANY_ENABLED
+            if (nd_network::IsWiFiConnected() && g_ptrSystem->HasWebSocketServer())
+                g_ptrSystem->GetWebSocketServer().Start();
+        #endif
+    #endif
+
+    // Start things that do not depend on the network
+
+    g_ptrSystem->SetupRenderService().Start();
+
+    #if USE_SCREEN
+        if (g_ptrSystem->HasDisplay())
+            g_ptrSystem->GetDisplay().Start();
+    #endif
+
+    // Audio is owned by AudioService so it can be reconfigured at runtime
+    // (e.g. moving the I2S DIN pin from the SetupUI) without a reboot. We
+    // construct the service unconditionally so consumers can ask "is audio
+    // available?" via a stable interface, and start it now if this build
+    // has ENABLE_AUDIO. DeviceConfig has already been loaded above, so
+    // AudioConfig::FromCurrentSettings() picks up any persisted pin.
+
+    auto& audioService = g_ptrSystem->SetupAudioService();
+    audioService.Reconfigure(AudioConfig::FromCurrentSettings());
+
+    #if ENABLE_REMOTE
+        if (g_ptrSystem->HasRemoteControl())
+            g_ptrSystem->GetRemoteControl().Start();
     #endif
 
     // Start the network-dependent services.  These will be NOPs on a non-wifi build.
 
-    taskManager.StartSerialThread();
-    taskManager.StartNetworkThread();
-    taskManager.StartColorDataThread();
-    taskManager.StartSocketThread();
+    #if ENABLE_AUDIOSERIAL
+        g_ptrSystem->SetupAudioSerialBridge().Start();
+    #endif
+    #if ENABLE_WIFI
+        // NetworkReader was constructed earlier (so effects could register).
+        // Start its task here, after WiFi credentials are loaded.
+        if (g_ptrSystem->HasNetworkReader())
+            g_ptrSystem->GetNetworkReader().Start();
+    #endif
+    #if COLORDATA_SERVER_ENABLED
+        g_ptrSystem->SetupColorStreamerService().Start();
+    #endif
+    #if INCOMING_WIFI_ENABLED
+        if (g_ptrSystem->HasSocketServer())
+            g_ptrSystem->GetSocketServer().Start();
+    #endif
+    #if ENABLE_WIFI
+        g_ptrSystem->SetupDebugConsole().Start();
+    #endif
 
-    SaveEffectManagerConfig();
+    DebugCLI::InitDebugCLI();
+    nd_network::InitNetworkCLI();
+
+#if ENABLE_OTA
+    ConfirmUpdate();
+#endif
     // Start the main loop
 }
 
@@ -562,19 +784,58 @@ void setup()
 
 void loop()
 {
+    // Add button support to the DEVKIT boards so you can step the effect
+
+    #if (defined(MESMERIZER_DEVKIT) || defined(MESMERIZER_DEVKIT_S3)) && defined(TOGGLE_BUTTON_0)
+        static Bounce2::Button s_nextEffectButton;
+        static bool s_nextEffectButtonInitialized = false;
+        if (!s_nextEffectButtonInitialized)
+        {
+            s_nextEffectButton.attach(TOGGLE_BUTTON_0, INPUT_PULLUP);
+            s_nextEffectButton.interval(5);
+            s_nextEffectButton.setPressedState(LOW);
+            s_nextEffectButtonInitialized = true;
+            debugI("Next-effect button initialized on GPIO %d", TOGGLE_BUTTON_0);
+        }
+    #endif
+
     while(true)
     {
-        #if ENABLE_WIFI
-            EVERY_N_MILLIS(20)
+        #if M5TAB
+            M5.update();
+            if (M5.Touch.getDetail().wasPressed() && g_ptrSystem->HasEffectManager())
+                g_ptrSystem->GetEffectManager().NextEffect();
+        #endif
+
+        #if (defined(MESMERIZER_DEVKIT) || defined(MESMERIZER_DEVKIT_S3)) && defined(TOGGLE_BUTTON_0)
+            s_nextEffectButton.update();
+            if (s_nextEffectButton.pressed() && g_ptrSystem->HasEffectManager())
             {
-                g_pImprovSerial->loop();
+                debugI("Next-effect button pressed");
+                g_ptrSystem->GetEffectManager().NextEffect();
             }
         #endif
+
+        // Improv owns the serial stream when WiFi is enabled. It forwards any
+        // non-Improv bytes to the serial CLI through its unknown-byte callback.
+#if ENABLE_WIFI
+        if (g_pImprovSerial)
+        {
+            g_pImprovSerial->loop();
+        }
+        else
+#endif
+        {
+            while (Serial.available())
+            {
+                ConsoleManager::Instance().FeedSerialByte(Serial.read());
+            }
+        }
 
         #if ENABLE_OTA
             try
             {
-                if (WiFi.isConnected())
+                if (nd_network::IsWiFiConnected())
                     ArduinoOTA.handle();
             }
             catch(const std::exception& e)
@@ -583,23 +844,29 @@ void loop()
             }
         #endif
 
-        EVERY_N_SECONDS(5)
+        // Keep operational telemetry independent of FastLED's timer macros.
+        // This runs on the Arduino loop task and deliberately catches up from
+        // the current time rather than emitting a burst after a long stall.
+        static uint32_t s_lastStatusUpdateMs = 0;
+        const uint32_t statusNowMs = millis();
+        if (s_lastStatusUpdateMs == 0 || statusNowMs - s_lastStatusUpdateMs >= 5000)
         {
+            s_lastStatusUpdateMs = statusNowMs;
             String strOutput;
 
             #if ENABLE_WIFI
-                strOutput += str_sprintf("WiFi: %s, MAC: %s, IP: %s ", WLtoString(WiFi.status()), WiFi.macAddress().c_str(), WiFi.localIP().toString().c_str());
+                strOutput += str_sprintf("WiFi: %s, MAC: %s, IP: %s ", nd_network::WLtoString(nd_network::GetWiFiStatus()), nd_network::GetMacAddress(":").c_str(), nd_network::GetWiFiLocalIP().c_str());
             #endif
 
-            strOutput += str_sprintf("Mem: %u, LargestBlk: %u, PSRAM Free: %u/%u, ", ESP.getFreeHeap(), ESP.getMaxAllocHeap(), ESP.getFreePsram(), ESP.getPsramSize());
-            strOutput += str_sprintf("LED FPS: %d ", g_Values.FPS);
+            strOutput += str_sprintf("Mem: %zu, LargestBlk: %zu, PSRAM Free: %zu/%zu, ", (size_t)ESP.getFreeHeap(), (size_t)ESP.getMaxAllocHeap(), (size_t)ESP.getFreePsram(), (size_t)ESP.getPsramSize());
+            strOutput += str_sprintf("LED FPS: %lu ", (unsigned long)g_Values.FPS);
 
-            #if USE_WS281X
-                strOutput += str_sprintf("LED Bright: %3.0lf%%, LED Watts: %u, ", g_Values.Brite, g_Values.Watts);
+            #if USE_STRIP
+                strOutput += str_sprintf("LED Bright: %3.0lf%%, LED Watts: %lu, ", g_Values.Brite, (unsigned long)g_Values.Watts);
             #endif
 
             #if USE_HUB75
-                strOutput += str_sprintf("Refresh: %d Hz, Power: %d mW, Brite: %3.0lf%%, ", HUB75GFX::matrix.getRefreshRate(), g_Values.MatrixPowerMilliwatts, g_Values.MatrixScaledBrightness / 2.55);
+                strOutput += str_sprintf("Refresh: %d Hz, Power: %d mW, Brite: %3.0lf%%, ", HUB75GFX::GetRefreshRate(), g_Values.MatrixPowerMilliwatts, g_Values.MatrixScaledBrightness / 2.55);
             #endif
 
             #if ENABLE_AUDIO
@@ -611,19 +878,27 @@ void loop()
             #endif
 
             #if INCOMING_WIFI_ENABLED
-                auto& bufferManager = g_ptrSystem->BufferManagers()[0];
-                strOutput += str_sprintf("Buffer: %d/%d, ", bufferManager.Depth(), bufferManager.BufferCount());
+                auto& bufferManager = g_ptrSystem->GetBufferManagers()[0];
+                {
+                    std::lock_guard guard(g_buffer_mutex);
+                    strOutput += str_sprintf("Buffer: %zu/%zu, ", (size_t)bufferManager.Depth(), (size_t)bufferManager.BufferCount());
+                }
             #endif
 
-            const auto& taskManager = g_ptrSystem->TaskManager();
+            const auto& taskManager = g_ptrSystem->GetTaskManager();
             strOutput += str_sprintf("CPU: %03.0f%%, %03.0f%%, FreeDraw: %4.3lf", taskManager.GetCPUUsagePercent(0), taskManager.GetCPUUsagePercent(1), g_Values.FreeDrawTime);
 
-            debugI("%s", strOutput.c_str());
+            // Status is user-facing operational telemetry, not diagnostic
+            // chatter. Send it directly to the console sinks so a runtime log
+            // threshold cannot suppress it and no second large formatting
+            // buffer needs to be allocated by Logger::Logf().
+            ConsoleManager::Instance().Broadcast(LogLevel::Info, TAG, strOutput.c_str());
         }
 
-        // Once an update is underway, we loop tightly on ArduinoOTA.handle.  Otherwise, we delay a bit to share the CPU.
-
-        if (!g_Values.UpdateStarted)
-            delay(1);
+        // Yield explicitly; Improv and OTA polling are non-blocking and do
+        // not otherwise guarantee that the Arduino loop task gives time back.
+        // A single tick also keeps ArduinoOTA.handle() serviced tightly once
+        // an update is underway.
+        delay(1);
     }
 }

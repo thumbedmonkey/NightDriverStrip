@@ -50,12 +50,6 @@ class PatternSMBlurringColors : public EffectWithId<PatternSMBlurringColors>
     std::array<PowderItem, powder_item_max_count> _powder_items;
 
     // matrix size constants are calculated only here and do not change in effects
-    const uint8_t CENTER_X_MINOR =
-        (MATRIX_WIDTH / 2) - ((MATRIX_WIDTH - 1) & 0x01); // the center of the matrix according to ICSU, shifted to the
-                                                          // smaller side, if the width is even
-    const uint8_t CENTER_Y_MINOR =
-        (MATRIX_HEIGHT / 2) -
-        ((MATRIX_HEIGHT - 1) & 0x01); // center of the YGREK matrix, shifted down if the height is even
     const uint8_t CENTER_X_MAJOR =
         MATRIX_WIDTH / 2 + (MATRIX_WIDTH % 2); // the center of the matrix according to IKSU,
                                                // shifted to a larger side, if the width is even
@@ -160,7 +154,7 @@ class PatternSMBlurringColors : public EffectWithId<PatternSMBlurringColors>
 
     void Start() override
     {
-        g()->Clear();
+        g().Clear();
 
         enlargedObjectNUM = (Scale + 5U); // / 99.0 * (AVAILABLE_BOID_COUNT) ;
         if (enlargedObjectNUM > AVAILABLE_BOID_COUNT)
@@ -188,7 +182,7 @@ class PatternSMBlurringColors : public EffectWithId<PatternSMBlurringColors>
     {
         step = deltaValue; // counter of the number of particles in the
                            // queue for nucleation in this loop
-        g()->blur2d(g()->leds, MATRIX_WIDTH, 0, MATRIX_HEIGHT, 0, 27);
+        g().blur2d(g().leds, MATRIX_WIDTH, 0, MATRIX_HEIGHT, 0, 27);
 
         // go over particles and update matrix cells on the way
         for (auto& powder_item : _powder_items)
@@ -205,7 +199,7 @@ class PatternSMBlurringColors : public EffectWithId<PatternSMBlurringColors>
                 CRGB baseRGB = CHSV(powder_item._hue, 255, 255);
 
                 baseRGB.nscale8(powder_item._state); // equivalent
-                g()->drawPixelXYF_Wu(powder_item._position_x, MATRIX_HEIGHT - 1 - powder_item._position_y, baseRGB);
+                g().drawPixelXYF_Wu(powder_item._position_x, MATRIX_HEIGHT - 1 - powder_item._position_y, baseRGB);
             }
         }
     }

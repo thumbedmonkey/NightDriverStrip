@@ -1,3 +1,4 @@
+#pragma once
 //+--------------------------------------------------------------------------
 //
 // File:        misceffects.h
@@ -29,15 +30,25 @@
 //
 //---------------------------------------------------------------------------
 
-#pragma once
+
+
+
+#if HEXAGON
+#include "ws281xgfx.h"
+#endif
 
 #include <deque>
+
+#include "array_utils.h"
+#include "effects.h"
+#include "nd_network.h"
+#include "ntptimeclient.h"
+#include "systemcontainer.h"
+#include "values.h"
 
 #if USE_MATRIX
 #include "TJpg_Decoder.h"
 #endif
-#include "effects.h"
-#include "systemcontainer.h"
 
 // SimpleRainbowTestEffect
 //
@@ -160,14 +171,16 @@ class RainbowFillEffect : public EffectWithId<RainbowFillEffect>
     float _speedDivisor;
     int   _deltaHue;
     bool  _mirrored;
+    bool  _fitLEDCount;
 
   public:
 
-    RainbowFillEffect(float speedDivisor = 12.0f, int deltaHue = 14, bool mirrored = false)
+    RainbowFillEffect(float speedDivisor = 12.0f, int deltaHue = 14, bool mirrored = false, bool fitLEDCount = false)
   : EffectWithId<RainbowFillEffect>("RainbowFill Rainbow"),
         _speedDivisor(speedDivisor),
         _deltaHue(deltaHue),
-        _mirrored(mirrored)
+        _mirrored(mirrored),
+        _fitLEDCount(fitLEDCount)
     {
         debugV("RainbowFill constructor");
     }
@@ -176,7 +189,8 @@ class RainbowFillEffect : public EffectWithId<RainbowFillEffect>
       : EffectWithId<RainbowFillEffect>(jsonObject),
         _speedDivisor(jsonObject[PTY_SPEEDDIVISOR]),
         _deltaHue(jsonObject[PTY_DELTAHUE]),
-        _mirrored(jsonObject[PTY_MIRRORED])
+        _mirrored(jsonObject[PTY_MIRRORED]),
+        _fitLEDCount(jsonObject[PTY_FITLEDCOUNT].is<bool>() ? jsonObject[PTY_FITLEDCOUNT].as<bool>() : false)
     {
         debugV("RainbowFill JSON constructor");
     }
@@ -191,6 +205,7 @@ class RainbowFillEffect : public EffectWithId<RainbowFillEffect>
         jsonDoc[PTY_SPEEDDIVISOR] = _speedDivisor;
         jsonDoc[PTY_DELTAHUE] = _deltaHue;
         jsonDoc[PTY_MIRRORED] = _mirrored;
+        jsonDoc[PTY_FITLEDCOUNT] = _fitLEDCount;
 
         return SetIfNotOverflowed(jsonDoc, jsonObject, __PRETTY_FUNCTION__);
     }
@@ -205,7 +220,29 @@ class RainbowFillEffect : public EffectWithId<RainbowFillEffect>
 
         hue += (float) msElapsed / _speedDivisor;
         hue = fmod(hue, 256.0);
-        fillRainbowAllChannels(0, _cLEDs, hue, _deltaHue, 1, _mirrored);
+        if (_fitLEDCount && _cLEDs > 0)
+        {
+            const float hueStep = 256.0f / static_cast<float>(_cLEDs);
+
+            for (size_t i = 0; i < _cLEDs; i++)
+            {
+                CHSV hsv;
+                hsv.hue = static_cast<uint8_t>(fmod(hue + static_cast<float>(i) * hueStep, 256.0f));
+                hsv.val = 255;
+                hsv.sat = 255;
+
+                CRGB rgb;
+                hsv2rgb_rainbow(hsv, rgb);
+
+                setPixelOnAllChannels(i, rgb);
+                if (_mirrored)
+                    setPixelOnAllChannels(_cLEDs - i - 1, rgb);
+            }
+        }
+        else
+        {
+            fillRainbowAllChannels(0, _cLEDs, hue, _deltaHue, 1, _mirrored);
+        }
         delay(10);
     }
 };
@@ -272,14 +309,14 @@ class ColorFillEffect : public EffectWithId<ColorFillEffect>
     {
         if (_everyNth != 1)
           fillSolidOnAllChannels(CRGB::Black);
-        if (!_ignoreGlobalColor && g_ptrSystem->DeviceConfig().ApplyGlobalColors())
-          fillSolidOnAllChannels(g_ptrSystem->DeviceConfig().GlobalColor(), 0, NUM_LEDS, _everyNth);
+        if (!_ignoreGlobalColor && g_ptrSystem->GetDeviceConfig().ApplyGlobalColors())
+          fillSolidOnAllChannels(g_ptrSystem->GetDeviceConfig().GlobalColor(), 0, NUM_LEDS, _everyNth);
         else
           fillSolidOnAllChannels(_color, 0, NUM_LEDS, _everyNth);
     }
 };
 
-#if USE_HUB75
+#if USE_HUB75 || USE_M5LCD
 
 // SplashLogoEffect
 //
@@ -323,12 +360,20 @@ class SplashLogoEffect : public EffectWithId<SplashLogoEffect>
     void Draw() override
     {
         fillSolidOnAllChannels(CRGB::Black);
-        if (JDR_OK != TJpgDec.drawJpg(0, 0, logo.contents, logo.length))        // Draw the image
+
+        uint16_t logoWidth = 0;
+        uint16_t logoHeight = 0;
+        if (JDR_OK == TJpgDec.getJpgSize(&logoWidth, &logoHeight, logo.contents, logo.length))
+            ConfigureMatrixJpegDecoder(logoWidth, logoHeight);
+
+        const auto drawResult = TJpgDec.drawJpg(0, 0, logo.contents, logo.length);
+        ConfigureMatrixJpegDecoder();
+        if (JDR_OK != drawResult)
             debugW("Could not display logo");
     }
 };
 
-#endif // USE_HUB75
+#endif // USE_HUB75 || USE_M5LCD
 
 // StatusEffect
 //
@@ -385,10 +430,12 @@ class StatusEffect : public EffectWithId<StatusEffect>
 
         if (g_Values.UpdateStarted)
           color = CRGB::Purple;
-        else if (!WiFi.isConnected())
+        else if (!nd_network::IsWiFiConnected())
           color = CRGB::Red;
+#if ENABLE_NTP
         else if (!NTPTimeClient::HasClockBeenSet())
           color = CRGB::Green;
+#endif
 
         if (_everyNth != 1)
           fillSolidOnAllChannels(CRGB::Black);
@@ -521,7 +568,7 @@ class SilonEffect : public EffectWithId<SilonEffect>
     SilonEffect() : EffectWithId<SilonEffect>("SilonEffect") {}
     SilonEffect(const JsonObjectConst& jsonObject) : EffectWithId<SilonEffect>(jsonObject) {}
 
-    virtual size_t DesiredFramesPerSecond() const
+    virtual size_t DesiredFramesPerSecond() const override
     {
         return 20;
     }
@@ -565,7 +612,7 @@ class PDPGridEffect : public EffectWithId<PDPGridEffect>
     PDPGridEffect() : EffectWithId<PDPGridEffect>("PDPGridEffect") {}
     PDPGridEffect(const JsonObjectConst& jsonObject) : EffectWithId<PDPGridEffect>(jsonObject) {}
 
-    virtual size_t DesiredFramesPerSecond() const
+    virtual size_t DesiredFramesPerSecond() const override
     {
         return 5;
     }
@@ -577,13 +624,13 @@ class PDPGridEffect : public EffectWithId<PDPGridEffect>
 
     virtual void Start() override
     {
-        g()->Clear();
+        g().Clear();
     }
 
     virtual void Draw() override
     {
         fadeAllChannelsToBlackBy(60);
-        g()->MoveY(1);
+        g().MoveY(1);
         for (int x = 0; x < MATRIX_WIDTH; x++)
         {
             // Pick a color, CRGB::Red 90% of the time, CRGB::Green 10% of the time
@@ -652,7 +699,7 @@ class PDPCMXEffect : public EffectWithId<PDPCMXEffect>
     PDPCMXEffect() : EffectWithId<PDPCMXEffect>("PDPCMXEffect") {}
     PDPCMXEffect(const JsonObjectConst& jsonObject) : EffectWithId<PDPCMXEffect>(jsonObject) {}
 
-    virtual size_t DesiredFramesPerSecond() const
+    virtual size_t DesiredFramesPerSecond() const override
     {
         return 30; // Moderate speed for scrolling effect
     }
@@ -664,7 +711,7 @@ class PDPCMXEffect : public EffectWithId<PDPCMXEffect>
 
     virtual void Start() override
     {
-        g()->Clear();
+        g().Clear();
     }
 
     virtual void Draw() override
@@ -716,4 +763,3 @@ class OuterHexRingEffect : public EffectWithId<OuterHexRingEffect>
     }
 };
 #endif // HEXAGON
-

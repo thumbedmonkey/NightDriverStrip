@@ -17,6 +17,10 @@
             "name": "ESP32",
             "projects": [
                 {
+                    "tag": "installer_strip",
+                    "name": "Guided Setup - Strip"
+                },
+                {
                     "tag": "atomlight",
                     "name": "Atom Light"
                 },
@@ -31,17 +35,6 @@
                 {
                     "tag": "umbrella",
                     "name": "Umbrella"
-                }
-            ]
-        },
-        {
-            "tag": "esp32-s3",
-            "chipfamily": "ESP32-S3",
-            "name": "ESP32-S3-DevKitC-1",
-            "projects": [
-                {
-                    "tag": "panlee",
-                    "name":"Panlee"
                 }
             ]
         },
@@ -172,6 +165,10 @@
             "name": "M5StickC Plus2",
             "projects": [
                 {
+                    "tag": "installer_m5",
+                    "name": "Guided Setup - M5"
+                },
+                {
                     "tag": "pdpgrid",
                     "name": "PDP Grid"
                 },
@@ -186,6 +183,10 @@
             "chipfamily": "ESP32",
             "name": "Mesmerizer",
             "projects": [
+                {
+                    "tag": "installer_matrix",
+                    "name": "Guided Setup - Matrix"
+                },
                 {
                     "tag": "mesmerizer",
                     "name": "Mesmerizer"

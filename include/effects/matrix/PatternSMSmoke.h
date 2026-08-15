@@ -16,6 +16,7 @@ private:
   uint8_t hue {0}, hue2 {0};   // gradual shift in hue or some other
                                // cyclic counter
   uint8_t deltaHue {0}, deltaHue2 {0};
+  bool horizontalPass {false};
 
 public:
 
@@ -32,7 +33,7 @@ public:
 
   void Start() override
   {
-    g()->Clear();
+    g().Clear();
   }
 
   void Draw() override
@@ -50,10 +51,10 @@ public:
 
       hue2++;
 
-    if (g()->IsPalettePaused())
+    if (g().IsPalettePaused())
     {
-      color = g()->ColorFromCurrentPalette(hue);
-      color2 = g()->ColorFromCurrentPalette(hue + 127);
+      color = g().ColorFromCurrentPalette(hue);
+      color2 = g().ColorFromCurrentPalette(hue + 127);
     }
     else
     {
@@ -70,10 +71,10 @@ public:
     // sky-written trailer of color.
     for (uint8_t y = 0; y < HEIGHT; y++)
     {
-      g()->leds[XY((deltaHue + y + 1U) % WIDTH, HEIGHT - 1U - y)] += color;
-      g()->leds[XY((deltaHue + y) % WIDTH, HEIGHT - 1U - y)] += color2; // color2
-      g()->leds[XY((deltaHue2 + y) % WIDTH, y)] += color;
-      g()->leds[XY((deltaHue2 + y + 1U) % WIDTH, y)] += color2; // color2
+      g().leds[XY((deltaHue + y + 1U) % WIDTH, HEIGHT - 1U - y)] += color;
+      g().leds[XY((deltaHue + y) % WIDTH, HEIGHT - 1U - y)] += color2; // color2
+      g().leds[XY((deltaHue2 + y) % WIDTH, y)] += color;
+      g().leds[XY((deltaHue2 + y + 1U) % WIDTH, y)] += color2; // color2
     }
 
     EVERY_N_MILLISECONDS(100)
@@ -82,15 +83,31 @@ public:
       // Calling SetNoise() in here will index past what was
       // FillGetNoised, which returns slowly scrolling bars
       // of black along X and Y axes.
-      g()->FillGetNoise();
-      // g()->SetNoise(1, 1, 1, 4, 4);
+      g().FillGetNoiseEdges();
+      // g().SetNoise(1, 1, 1, 4, 4);
     }
 
-    // Lower number for thicker, more static fog. Higher for more wisp.
-    g()->MoveFractionalNoiseX(3);
-    g()->MoveFractionalNoiseY(3);
-    // Without this, we get tornadoes where the diagonals cross as there's
-    // an excess of set pixels there.
-    g()->BlurFrame(10);
+    if (WIDTH <= 64 && HEIGHT <= 32)
+    {
+      g().MoveFractionalNoiseX(1);
+      g().MoveFractionalNoiseY(1);
+      g().blurRows(g().leds, WIDTH, HEIGHT, 0, 10);
+      g().blurColumns(g().leds, WIDTH, HEIGHT, 1, 10);
+    }
+    else
+    {
+      // Alternate axes on large logical surfaces to keep scanout responsive.
+      horizontalPass = !horizontalPass;
+      if (horizontalPass)
+      {
+        g().MoveFractionalNoiseX(2);
+        g().blurRows(g().leds, WIDTH, HEIGHT, 0, 20);
+      }
+      else
+      {
+        g().MoveFractionalNoiseY(2);
+        g().blurColumns(g().leds, WIDTH, HEIGHT, 1, 20);
+      }
+    }
   }
 };

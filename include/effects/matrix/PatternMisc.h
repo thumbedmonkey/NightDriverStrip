@@ -1,3 +1,5 @@
+#pragma once
+
 //+--------------------------------------------------------------------------
 //
 // File:        PatternMisc.h
@@ -73,22 +75,22 @@ class PatternSunburst : public EffectWithId<PatternSunburst>
     void Draw() override
     {
         uint8_t dim = beatsin8(2, 210, 250);
-        g()->DimAll(dim);
+        g().DimAll(dim);
 
         for (int i = 2; i <= MATRIX_WIDTH / 2; i++)
         {
-            CRGB color = g()->ColorFromCurrentPalette((i - 2) * (240 / (MATRIX_WIDTH / 2)));
+            CRGB color = g().ColorFromCurrentPalette((i - 2) * (240 / (MATRIX_WIDTH / 2)));
 
             // The LIB8TION library defines beatsin8, but this needed beatcos8 which did not exist, so I
             // added it to the graphics interface rathe than adding it to a custom version of lib8tion
 
-            uint8_t x = g()->beatcos8((17 - i) * 2, MATRIX_CENTER_X - i, MATRIX_CENTER_X + i);
+            uint8_t x = g().beatcos8((17 - i) * 2, MATRIX_CENTER_X - i, MATRIX_CENTER_X + i);
             uint8_t y = beatsin8((17 - i) * 2, MATRIX_CENTER_Y - i, MATRIX_CENTER_Y + i);
 
             if (color.r != 0 || color.g != 0 || color.b != 0)
             {
-                if (g()->isValidPixel(x,y))
-                    g()->setPixel(x, y, color);
+                if (g().isValidPixel(x,y))
+                    g().setPixel(x, y, color);
             }
         }
     }
@@ -114,31 +116,55 @@ class PatternRose : public EffectWithId<PatternRose>
     void Draw() override
     {
         uint8_t dim = beatsin8(2, 170, 250);
-        g()->DimAll(dim);
+        g().DimAll(dim);
 
+        // The original Aurora effect was fixed at 32x32. Scale its concentric
+        // orbits to the current aspect ratio and derive the point count from
+        // the shorter axis. Keeping the geometry in 16-bit values prevents
+        // the constants and bounds from wrapping once a dimension exceeds 32.
+        constexpr uint16_t pointCount = std::min(MATRIX_WIDTH, MATRIX_HEIGHT);
+        constexpr uint16_t halfPointCount = pointCount / 2;
 
-        for (uint16_t i = 0; i < MATRIX_HEIGHT; i++)
+        const auto scaleCoordinate = [](uint16_t coordinate, uint16_t extent)
         {
-            CRGB color;
+            return static_cast<uint8_t>(
+                (static_cast<uint32_t>(coordinate) * (extent - 1) +
+                 pointCount / 2) / pointCount);
+        };
 
-            uint8_t x = 0;
-            uint8_t y = 0;
+        for (uint16_t i = 0; i < pointCount; ++i)
+        {
+            const bool inward = i < halfPointCount;
+            const uint16_t phase = inward ? i + 1 : pointCount - i;
+            const uint16_t low = inward ? i : pointCount - i;
+            const uint16_t high = inward ? pointCount - i : i + 1;
+            const uint8_t beatsPerMinute =
+                static_cast<uint8_t>(std::min<uint16_t>(phase * 2, 255));
 
-            if (i < 16)
+            const uint8_t lowX = scaleCoordinate(low, MATRIX_WIDTH);
+            const uint8_t highX = scaleCoordinate(high, MATRIX_WIDTH);
+            const uint8_t lowY = scaleCoordinate(low, MATRIX_HEIGHT);
+            const uint8_t highY = scaleCoordinate(high, MATRIX_HEIGHT);
+
+            uint8_t x;
+            uint8_t y;
+            if (inward)
             {
-                x = g()->beatcos8((i + 1) * 2, i, MATRIX_HEIGHT - i) + 16;
-                y = beatsin8((i + 1) * 2, i, MATRIX_HEIGHT - i);
-                color = g()->ColorFromCurrentPalette(i * 14);
+                x = g().beatcos8(beatsPerMinute, lowX, highX);
+                y = beatsin8(beatsPerMinute, lowY, highY);
             }
             else
             {
-                x = beatsin8((32 - i) * 2, MATRIX_WIDTH - i, i + 1) + 16;
-                y = g()->beatcos8((32 - i) * 2, MATRIX_WIDTH - i, i + 1);
-                color = g()->ColorFromCurrentPalette((31 - i) * 14);
+                x = beatsin8(beatsPerMinute, lowX, highX);
+                y = g().beatcos8(beatsPerMinute, lowY, highY);
             }
 
-            if (g()->isValidPixel(x, y))
-                g()->setPixel(x, y, color);
+            const uint16_t distanceFromEnd =
+                inward ? i : pointCount - 1 - i;
+            const uint8_t colorIndex = static_cast<uint8_t>(
+                (static_cast<uint32_t>(distanceFromEnd) * 224) /
+                std::max<uint16_t>(halfPointCount, 1));
+            g().setPixel(x, y, g().ColorFromCurrentPalette(colorIndex));
         }
     }
 };
@@ -153,7 +179,7 @@ class PatternPinwheel : public EffectWithId<PatternPinwheel>
 
     void Start() override
     {
-        g()->Clear();
+        g().Clear();
     }
 
     virtual size_t DesiredFramesPerSecond() const override
@@ -166,19 +192,38 @@ class PatternPinwheel : public EffectWithId<PatternPinwheel>
         uint8_t dim = beatsin8(2, 30, 70);
         fadeAllChannelsToBlackBy(dim);
 
-        for (uint8_t i = 0; i < 64; i++)
+        constexpr uint16_t pointCount = std::min(MATRIX_WIDTH, MATRIX_HEIGHT);
+        constexpr uint16_t halfPointCount = pointCount / 2;
+
+        const auto scaleCoordinate = [](uint16_t coordinate, uint16_t extent)
         {
-            CRGB color;
+            return static_cast<uint8_t>(
+                (static_cast<uint32_t>(coordinate) * (extent - 1) +
+                 (pointCount - 1) / 2) / (pointCount - 1));
+        };
 
-            uint8_t x = 0;
-            uint8_t y = 0;
+        for (uint16_t i = 0; i < pointCount; ++i)
+        {
+            // Move from the outer ellipse to the center and back out without
+            // relying on the reversed uint8_t beat ranges used by the original
+            // fixed 64x32 implementation.
+            const uint16_t inset =
+                i < halfPointCount ? i : pointCount - 1 - i;
+            const uint16_t opposite = pointCount - 1 - inset;
+            const uint8_t lowX = scaleCoordinate(inset, MATRIX_WIDTH);
+            const uint8_t highX = scaleCoordinate(opposite, MATRIX_WIDTH);
+            const uint8_t lowY = scaleCoordinate(inset, MATRIX_HEIGHT);
+            const uint8_t highY = scaleCoordinate(opposite, MATRIX_HEIGHT);
+            const uint8_t beatsPerMinute = static_cast<uint8_t>(
+                std::min<uint16_t>((pointCount - i) * 2, 255));
 
-            x = beatsin8((64 - i) * 2, MATRIX_HEIGHT - i, i + 1) + 16;
-            y = g()->beatcos8((64 - i) * 2, MATRIX_HEIGHT - i, i + 1);
-            color = g()->ColorFromCurrentPalette((64 - i) * 14);
+            const uint8_t x = beatsin8(beatsPerMinute, lowX, highX);
+            const uint8_t y = g().beatcos8(beatsPerMinute, lowY, highY);
+            const uint8_t colorIndex = static_cast<uint8_t>(
+                (static_cast<uint32_t>(pointCount - 1 - i) * 255) /
+                (pointCount - 1));
 
-            if (g()->isValidPixel(x, y))
-                g()->setPixel(x, y, color);
+            g().setPixel(x, y, g().ColorFromCurrentPalette(colorIndex));
         }
     }
 };
@@ -202,24 +247,24 @@ public:
     {
         // dim all pixels on the display slightly
         // to 250/255 (98%) of their current brightness
-        g()->DimAll(250);
+        g().DimAll(250);
 
         // the Effects class has some sample oscillators
         // that move from 0 to 255 at different speeds
-        g()->MoveOscillators();
+        g().MoveOscillators();
 
         // the horizontal position of the head of the infinity sign
         // oscillates from 0 to the maximum horizontal and back
-        int x = (MATRIX_WIDTH - 1) - g()->p[1];
+        int x = (MATRIX_WIDTH - 1) - g().p[1];
 
         // the vertical position of the head oscillates up and down
 
         const int ymargin = 6;
-        int y = map8(sin8(g()->osci[3]), ymargin, MATRIX_HEIGHT - ymargin);
+        int y = map8(sin8(g().osci[3]), ymargin, MATRIX_HEIGHT - ymargin);
 
         // the hue oscillates from 0 to 255, overflowing back to 0
 
-        uint8_t hue = sin8(g()->osci[5]);
+        uint8_t hue = sin8(g().osci[5]);
 
         // draw a pixel at x,y using a color from the current palette
         if (_lastX == -1)
@@ -228,11 +273,11 @@ public:
             _lastY = y;
         }
 
-        g()->drawLine(_lastX, _lastY, x, y, g()->ColorFromCurrentPalette(hue));
+        g().drawLine(_lastX, _lastY, x, y, g().ColorFromCurrentPalette(hue));
         _lastX = x;
         _lastY = y;
 
-        //g()->setPixel(x, y, g()->ColorFromCurrentPalette(hue));
+        //g().setPixel(x, y, g().ColorFromCurrentPalette(hue));
 
     }
 };
@@ -268,8 +313,8 @@ public:
         {
             for (uint16_t y = 0; y < MATRIX_HEIGHT; y++)
             {
-                g()->leds[XY(x, y)] = (x ^ y ^ flip) < count
-                    ? g()->ColorFromCurrentPalette(((x ^ y) << 2) + generation)
+                g().leds[XY(x, y)] = (x ^ y ^ flip) < count
+                    ? g().ColorFromCurrentPalette(((x ^ y) << 2) + generation)
                     : CRGB::Black;
             }
         }

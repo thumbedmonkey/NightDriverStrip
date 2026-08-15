@@ -1,3 +1,5 @@
+#pragma once
+
 //+--------------------------------------------------------------------------
 //
 // File:        systemcontainer.h
@@ -28,276 +30,214 @@
 //
 //---------------------------------------------------------------------------
 
-#pragma once
-
-#include "effectmanager.h"
-#include "taskmgr.h"
-#include "jsonserializer.h"
-#include "network.h"
+#include "globals.h"
 #include "deviceconfig.h"
-#include "screen.h"
-#include "socketserver.h"
-#include "websocketserver.h"
-#include "remotecontrol.h"
-#include "webserver.h"
-#include "types.h"
+#include "interfaces.h"
+
+#include <ArduinoJson.h>
+#include <memory>
+#include <vector>
+
+class GFXBase;
+class EffectManager;
+class LEDStripEffect;
+class JSONWriter;
+class LEDBuffer;
+class LEDBufferManager;
+class TaskManager;
+class RemoteControl;
+class Screen;
+class SocketServer;
+class WebSocketServer;
+class CWebServer;
+class WS281xOutputManager;
+class APA102OutputManager;
+class IStripOutputManager;
+class AudioService;
+class AudioSerialBridge;
+class DebugConsole;
+class ColorStreamerService;
+class RenderService;
+namespace nd_network { class NetworkReader; }
+using nd_network::NetworkReader;
+
+enum NetworkPort : int;
 
 // SystemContainer
 //
 // Holds a number of system-wide objects that take care of core/supportive functions on the chip.
-// The objects are added to this class in an "enriched property" style. This means that for each object, the class
-// contains:
-// - A declaration of the member variable (using SC_DECLARE)
-// - A Setup method that creates and returns the object in question (mostly through SC_SIMPLE_SETUP_FOR or
-//   SC_FORWARDING_SETUP_FOR)
-// - A Has method that returns true if the object has been Setup, and a property getter that returns a reference to
-//   the actual object (both using SC_GETTERS_FOR)
-//
-// The difference between SC_SIMPLE_SETUP_FOR and SC_FORWARDING_SETUP_FOR is that the former invokes a parameterless
-// constructor when creating the object, and the latter forwards any arguments passed to it on to the constructor.
-//
-// SC_SIMPLE_PROPERTY and SC_FORWARDING_PROPERTY are provided for convenience; they combine a declaration, simple or
-// forwarding Setup method, and the Has and getter methods.
-//
-// Most macros accept two parameters:
-// - The name of the property, as used in the Setup, Has and getter methods
-// - The type of the property, as held/returned by this class
-//
-// The actual composition of this class is largely driven by the macros mentioned, only irregular Setup methods are
-// coded manually.
-
-// Name of the unique_ptr member for a specific property name
-#define SC_MEMBER(name) _ptr ## name
-
-// Declares the member variable for a property with indicated type and name
-#define SC_DECLARE(name, ...) \
-  private: \
-    std::unique_ptr<::__VA_ARGS__> SC_MEMBER(name) = nullptr;
-
-// Creates a Setup method for a property (with indicated type and name) that invokes a parameterless constructor
-#define SC_SIMPLE_SETUP_FOR(name, ...) \
-  public: \
-    ::__VA_ARGS__& Setup ## name() \
-    { \
-        if (!SC_MEMBER(name)) \
-            SC_MEMBER(name).reset(new ::__VA_ARGS__()); \
-        return *SC_MEMBER(name); \
-    }
-
-// Creates a Setup method for a property (with indicated type and name) that forwards any arguments to the constructor
-#define SC_FORWARDING_SETUP_FOR(name, ...) \
-  public: \
-    template<typename... Args> \
-    ::__VA_ARGS__& Setup ## name(Args&&... args) \
-    { \
-        if (!SC_MEMBER(name)) \
-            SC_MEMBER(name).reset(new ::__VA_ARGS__(std::forward<Args>(args)...)); \
-        return *SC_MEMBER(name); \
-    }
-
-// Creates the Has and getter methods for a property with indicated type and name
-#define SC_GETTERS_FOR(name, ...) \
-  public: \
-    bool Has ## name() const \
-    { \
-        return !!SC_MEMBER(name); \
-    } \
-    \
-    ::__VA_ARGS__& name() const \
-    { \
-        CheckPointer(SC_MEMBER(name), #name); \
-        return *SC_MEMBER(name); \
-    }
-
-// Creates a full property with the type and name indicated, having a simple Setup method
-#define SC_SIMPLE_PROPERTY(name, ...) \
-    SC_DECLARE(name, __VA_ARGS__) \
-    SC_SIMPLE_SETUP_FOR(name, __VA_ARGS__) \
-    SC_GETTERS_FOR(name, __VA_ARGS__)
-
-// Creates a full property with the type and name indicated, having a forwarding Setup method
-#define SC_FORWARDING_PROPERTY(name, ...) \
-    SC_DECLARE(name, __VA_ARGS__) \
-    SC_FORWARDING_SETUP_FOR(name, __VA_ARGS__) \
-    SC_GETTERS_FOR(name, __VA_ARGS__)
-
 class SystemContainer
 {
+  public:
+    using DeviceContainer = std::vector<std::shared_ptr<GFXBase>>;
+    using BufferManagerContainer = std::vector<LEDBufferManager, psram_allocator<LEDBufferManager>>;
+
   private:
-    // Helper method that checks if a pointer is initialized. Throws a runtime error if not.
-    template<typename Tp>
-    inline void CheckPointer(const std::unique_ptr<Tp>& pointer, const String& name) const
-    {
-        if (!pointer)
-        {
-            debugE("Calling getter for %s with pointer uninitialized!", name.c_str());
-            delay(1000);
-            throw std::runtime_error("Calling SystemContainer getter with uninitialized pointer!");
-        }
-    }
-
-    // -------------------------------------------------------------
-    // Devices
-
-    SC_SIMPLE_PROPERTY(Devices, std::vector<std::shared_ptr<GFXBase>>)
-
-    // -------------------------------------------------------------
-    // BufferManagers
-
-    SC_DECLARE(BufferManagers, std::vector<LEDBufferManager, psram_allocator<LEDBufferManager>>)
-
-    public: std::vector<LEDBufferManager, psram_allocator<LEDBufferManager>>& SetupBufferManagers()
-    {
-        if (!!SC_MEMBER(BufferManagers))
-            return *SC_MEMBER(BufferManagers);
-
-        if (!SC_MEMBER(Devices) || SC_MEMBER(Devices)->empty())
-        {
-            debugE("Can't setup BufferManagers without Devices!");
-            delay(1000);
-            throw std::runtime_error("Attempt to setup BufferManagers without Devices");
-        }
-
-        #if USE_PSRAM
-            uint32_t memtouse = ESP.getFreePsram() - RESERVE_MEMORY;
-        #else
-            uint32_t memtouse = ESP.getFreeHeap() - RESERVE_MEMORY;
-        #endif
-
-        uint32_t memtoalloc = (SC_MEMBER(Devices)->size() * (sizeof(LEDBuffer) + NUM_LEDS * sizeof(CRGB)));
-        uint32_t cBuffers = memtouse / memtoalloc;
-
-        if (cBuffers < MIN_BUFFERS)
-        {
-            debugI("Not enough memory, could only allocate %d buffers and need %d\n", cBuffers, MIN_BUFFERS);
-            throw std::runtime_error("Could not allocate all buffers");
-        }
-        if (cBuffers > MAX_BUFFERS)
-        {
-            debugI("Could allocate %d buffers but limiting it to %d\n", cBuffers, MAX_BUFFERS);
-            cBuffers = MAX_BUFFERS;
-        }
-
-        debugW("Reserving %d LED buffers for a total of %d bytes...", cBuffers, memtoalloc * cBuffers);
-
-        SC_MEMBER(BufferManagers) = make_unique_psram<std::vector<LEDBufferManager, psram_allocator<LEDBufferManager>>>();
-
-        for (auto& device : *SC_MEMBER(Devices))
-            SC_MEMBER(BufferManagers)->emplace_back(cBuffers, device);
-
-        return *SC_MEMBER(BufferManagers);
-    }
-
-    SC_GETTERS_FOR(BufferManagers, std::vector<LEDBufferManager, psram_allocator<LEDBufferManager>>)
-
-    // -------------------------------------------------------------
-    // EffectManager
-
-    SC_FORWARDING_PROPERTY(EffectManager, EffectManager)
-
-    // -------------------------------------------------------------
-    // TaskManager
-
-    SC_DECLARE(TaskManager, NightDriverTaskManager)
-
-    // Creates, begins and returns the TaskManager
-    public: ::NightDriverTaskManager& SetupTaskManager()
-    {
-        if (!SC_MEMBER(TaskManager))
-        {
-            SC_MEMBER(TaskManager) = make_unique_psram<::NightDriverTaskManager>();
-            SC_MEMBER(TaskManager)->begin();
-        }
-
-        return *SC_MEMBER(TaskManager);
-    }
-
-    SC_GETTERS_FOR(TaskManager, NightDriverTaskManager)
-
-    // -------------------------------------------------------------
-    // Config objects: JSONWriter, DeviceConfig
-
-    SC_DECLARE(DeviceConfig, DeviceConfig)
-    SC_DECLARE(JSONWriter, JSONWriter)
-
-    // Creates and returns the config objects. Requires TaskManager to have already been setup.
-    public: void SetupConfig()
-    {
-        if (!SC_MEMBER(TaskManager))
-        {
-            debugE("Can't setup config objects without TaskManager!");
-            delay(1000);
-            throw std::runtime_error("Attempt to setup config objects without TaskManager");
-        }
-
-        // Create the JSON writer and start its background thread
-        if (!SC_MEMBER(JSONWriter))
-        {
-            SC_MEMBER(JSONWriter) = make_unique_psram<::JSONWriter>();
-            SC_MEMBER(TaskManager)->StartJSONWriterThread();
-        }
-
-        // Create and load device config from SPIFFS if possible
-        if (!SC_MEMBER(DeviceConfig))
-            SC_MEMBER(DeviceConfig) = make_unique_psram<::DeviceConfig>();
-    }
-
-    SC_GETTERS_FOR(JSONWriter, JSONWriter)
-    SC_GETTERS_FOR(DeviceConfig, DeviceConfig)
-
-    // -------------------------------------------------------------
-    // NetworkReader
-
-    #if ENABLE_WIFI
-        SC_SIMPLE_PROPERTY(NetworkReader, NetworkReader)
-    #endif
-
-    // -------------------------------------------------------------
-    // WebServer
-
-    #if ENABLE_WIFI && ENABLE_WEBSERVER
-        SC_SIMPLE_PROPERTY(WebServer, CWebServer)
-    #endif
-
-    // -------------------------------------------------------------
-    // SocketServer
-
-    #if INCOMING_WIFI_ENABLED
-        SC_FORWARDING_PROPERTY(SocketServer, SocketServer)
-    #endif
-
-    // -------------------------------------------------------------
-    // WebSocketServer
-
-    #if WEB_SOCKETS_ANY_ENABLED
-        SC_FORWARDING_PROPERTY(WebSocketServer, WebSocketServer)
-    #endif
-
-
-    // -------------------------------------------------------------
-    // RemoteControl
+    std::unique_ptr<DeviceContainer> _ptrDevices;
+    allocated_unique_ptr<BufferManagerContainer> _ptrBufferManagers;
+    allocated_unique_ptr<EffectManager> _ptrEffectManager;
+    allocated_unique_ptr<TaskManager> _ptrTaskManager;
+    allocated_unique_ptr<JSONWriter> _ptrJSONWriter;
+    allocated_unique_ptr<DeviceConfig> _ptrDeviceConfig;
 
     #if ENABLE_REMOTE
-        SC_SIMPLE_PROPERTY(RemoteControl, RemoteControl)
+        allocated_unique_ptr<RemoteControl> _ptrRemoteControl;
     #endif
 
-    // -------------------------------------------------------------
-    // Display
+    #if ENABLE_WIFI
+        allocated_unique_ptr<NetworkReader> _ptrNetworkReader;
+    #endif
+
+    #if ENABLE_WIFI && ENABLE_WEBSERVER
+        allocated_unique_ptr<CWebServer> _ptrWebServer;
+    #endif
+
+    #if INCOMING_WIFI_ENABLED
+        allocated_unique_ptr<SocketServer> _ptrSocketServer;
+    #endif
+
+    #if USE_STRIP
+        allocated_unique_ptr<IStripOutputManager> _ptrStripOutputManager;
+    #endif
+
+    #if WEB_SOCKETS_ANY_ENABLED
+        allocated_unique_ptr<WebSocketServer> _ptrWebSocketServer;
+    #endif
 
     #if USE_SCREEN
-        SC_DECLARE(Display, Screen)
-
-        // Creates and returns the display. The exact screen type is a template argument.
-        public: template<typename Ts, typename... Args>
-        ::Screen& SetupDisplay(Args&&... args)
-        {
-            SC_MEMBER(Display) = make_unique_psram<Ts>(std::forward<Args>(args)...);
-
-            return *SC_MEMBER(Display);
-        }
-
-        SC_GETTERS_FOR(Display, Screen)
+        allocated_unique_ptr<Screen> _ptrDisplay;
     #endif
+
+    // AudioService is constructed in audio-enabled and non-audio builds alike.
+    // The service exposes a stable interface and degrades to a silent stub
+    // when ENABLE_AUDIO is 0, which keeps consumers (e.g. webserver, drawing
+    // VU meter) free of #if guards.
+
+    allocated_unique_ptr<AudioService> _ptrAudioService;
+
+    #if ENABLE_AUDIOSERIAL
+        allocated_unique_ptr<AudioSerialBridge> _ptrAudioSerialBridge;
+    #endif
+
+    #if ENABLE_WIFI
+        allocated_unique_ptr<DebugConsole> _ptrDebugConsole;
+    #endif
+
+    #if COLORDATA_SERVER_ENABLED
+        allocated_unique_ptr<ColorStreamerService> _ptrColorStreamerService;
+    #endif
+
+    allocated_unique_ptr<RenderService> _ptrRenderService;
+
+    // Helper method that checks if a pointer is initialized.
+    void CheckPointer(bool initialized, const char* name) const;
+
+  public:
+    SystemContainer();
+    ~SystemContainer();
+
+    // Devices
+    DeviceContainer& SetupDevices();
+    bool HasDevices() const { return !!_ptrDevices; }
+    DeviceContainer& GetDevices() const;
+
+    // BufferManagers
+    BufferManagerContainer& SetupBufferManagers();
+    bool HasBufferManagers() const { return !!_ptrBufferManagers; }
+    BufferManagerContainer& GetBufferManagers() const;
+
+    // EffectManager
+    EffectManager& SetupEffectManager(const std::shared_ptr<LEDStripEffect>& effect, DeviceContainer& devices);
+    EffectManager& SetupEffectManager(DeviceContainer& devices);
+    EffectManager& SetupEffectManager(const JsonObjectConst& jsonObject, DeviceContainer& devices);
+    bool HasEffectManager() const { return !!_ptrEffectManager; }
+    EffectManager& GetEffectManager() const;
+
+    // TaskManager
+    TaskManager& SetupTaskManager();
+    bool HasTaskManager() const { return !!_ptrTaskManager; }
+    TaskManager& GetTaskManager() const;
+
+    // Config objects
+    void SetupConfig();
+    SuccessResultWithMessage ApplyRuntimeConfiguration();
+    SuccessResultWithMessage ApplyRuntimeConfigurationTransaction(const DeviceConfig::RuntimeConfig& requestedConfig);
+    int GetConfiguredAudioInputPin() const;
+    bool HasJSONWriter() const { return !!_ptrJSONWriter; }
+    JSONWriter& GetJSONWriter() const;
+    bool HasDeviceConfig() const { return !!_ptrDeviceConfig; }
+    DeviceConfig& GetDeviceConfig() const;
+
+    #if ENABLE_WIFI
+        NetworkReader& SetupNetworkReader();
+        bool HasNetworkReader() const { return !!_ptrNetworkReader; }
+        NetworkReader& GetNetworkReader() const;
+    #endif
+
+    #if ENABLE_WIFI && ENABLE_WEBSERVER
+        CWebServer& SetupWebServer();
+        bool HasWebServer() const { return !!_ptrWebServer; }
+        CWebServer& GetWebServer() const;
+    #endif
+
+    #if INCOMING_WIFI_ENABLED
+        SocketServer& SetupSocketServer(NetworkPort port, int ledCount);
+        bool HasSocketServer() const { return !!_ptrSocketServer; }
+        SocketServer& GetSocketServer() const;
+    #endif
+
+    #if USE_STRIP
+        IStripOutputManager& SetupStripOutputManager();
+        bool HasStripOutputManager() const { return !!_ptrStripOutputManager; }
+        IStripOutputManager& GetStripOutputManager() const;
+    #endif
+
+    #if WEB_SOCKETS_ANY_ENABLED
+        WebSocketServer& SetupWebSocketServer(CWebServer& webServer);
+        bool HasWebSocketServer() const { return !!_ptrWebSocketServer; }
+        WebSocketServer& GetWebSocketServer() const;
+    #endif
+
+    #if ENABLE_REMOTE
+        RemoteControl& SetupRemoteControl();
+        bool HasRemoteControl() const { return !!_ptrRemoteControl; }
+        RemoteControl& GetRemoteControl() const;
+    #endif
+
+    #if USE_SCREEN
+        Screen& SetupHardwareDisplay(int w, int h);
+        bool HasDisplay() const { return !!_ptrDisplay; }
+        Screen& GetDisplay() const;
+    #endif
+
+    // AudioService. SetupAudioService() creates the service in stopped state;
+    // call Start() on the returned reference once DeviceConfig is available.
+
+    AudioService& SetupAudioService();
+    bool HasAudioService() const { return nullptr != _ptrAudioService; }
+    AudioService& GetAudioService() const;
+
+    #if ENABLE_AUDIOSERIAL
+        AudioSerialBridge& SetupAudioSerialBridge();
+        bool HasAudioSerialBridge() const { return nullptr != _ptrAudioSerialBridge; }
+        AudioSerialBridge& GetAudioSerialBridge() const;
+    #endif
+
+    #if ENABLE_WIFI
+        DebugConsole& SetupDebugConsole();
+        bool HasDebugConsole() const { return nullptr != _ptrDebugConsole; }
+        DebugConsole& GetDebugConsole() const;
+    #endif
+
+    #if COLORDATA_SERVER_ENABLED
+        ColorStreamerService& SetupColorStreamerService();
+        bool HasColorStreamerService() const { return nullptr != _ptrColorStreamerService; }
+        ColorStreamerService& GetColorStreamerService() const;
+    #endif
+
+    RenderService& SetupRenderService();
+    bool HasRenderService() const { return nullptr != _ptrRenderService; }
+    RenderService& GetRenderService() const;
 };
 
-extern DRAM_ATTR std::unique_ptr<SystemContainer> g_ptrSystem;
+extern std::unique_ptr<SystemContainer> g_ptrSystem;

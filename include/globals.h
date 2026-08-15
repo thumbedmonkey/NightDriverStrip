@@ -1,3 +1,5 @@
+#pragma once
+
 //+--------------------------------------------------------------------------
 //
 // File:        Globals.h
@@ -84,16 +86,25 @@
 
 #pragma once
 
-#include <sstream>
-#include <iomanip>
-
 //  See https://github.com/PlummersSoftwareLLC/NightDriverStrip/issues/515
 #define FASTLED_ESP32_FLASH_LOCK 1
 #define FASTLED_INTERNAL 1               // Suppresses build banners
+#include <atomic>
+#include <mutex>
+extern std::mutex g_buffer_mutex;
+
+// Protects the active render/configuration pipeline so runtime topology/output changes
+// cannot reconfigure device buffers while a frame is being prepared, drawn, or emitted.
+// Splitting this into two mutexes (render and effect manager) allows effects to change without 
+// blocking the entire render pipeline, which is important for effects that need to update every 
+// frame like the spectrum analyzer, but it looks redundant in many cases when acquired!
+
+extern std::recursive_mutex g_render_mutex;
+
+// Protects effect state transitions and effect-manager mutations.
+extern std::recursive_mutex g_effect_manager_mutex;
+
 #include <FastLED.h>
-
-#include <RemoteDebug.h>
-
 // If we're not using GNU C, (unlikely in embedded, especially in this
 // heavily ESP/Arduino-accented probject) elide __attribute__ - but even
 // clang defines and supports this...
@@ -111,17 +122,42 @@
 
 #define FLASH_VERSION          40   // Update ONLY this to increment the version number
 
-#ifndef USE_HUB75                   // We support strips by default unless specifically defined out
-    #ifndef USE_WS281X
+// Output transport selection: exactly one of USE_HUB75 / USE_M5LCD /
+// USE_WS281X / USE_APA102.
+// USE_STRIP is derived from the two strip transports.
+#ifndef USE_HUB75
+    #define USE_HUB75 0
+#endif
+
+#ifndef USE_M5LCD
+    #define USE_M5LCD 0
+#endif
+
+#ifndef USE_APA102
+    #define USE_APA102 0
+#endif
+
+#ifndef USE_WS281X
+    // Strip projects historically defaulted to WS281x whenever the build
+    // wasn't a dedicated matrix transport or APA102. Preserve that default.
+    #if !USE_HUB75 && !USE_M5LCD && !USE_APA102
         #define USE_WS281X 1
+    #else
+        #define USE_WS281X 0
     #endif
 #endif
 
-#define XSTR(x) STR(x)              // The defs will generate the stringized version of it
+#define USE_STRIP (USE_WS281X || USE_APA102)
+
+#if (USE_HUB75 + USE_M5LCD + USE_WS281X + USE_APA102) != 1
+    #error "Define exactly one output transport: USE_HUB75, USE_M5LCD, USE_WS281X, or USE_APA102"
+#endif
+
+#define XSTR(x) ND_STR(x)           // The defs will generate the stringized version of it
 #if FLASH_VERSION > 99
-    #define STR(x) "v"#x
+    #define ND_STR(x) "v"#x
 #else
-    #define STR(x) "v0"#x
+    #define ND_STR(x) "v0"#x
 #endif
 #define FLASH_VERSION_NAME_X(x) "v"#x
 #define FLASH_VERSION_NAME XSTR(FLASH_VERSION)
@@ -146,20 +182,17 @@
 // of the OLED/LCD is now controlled separately, but M5 is always equipped
 // with one (but it doesn't have to be used!).
 
-#if M5STICKC || M5STICKCPLUS || M5STICKCPLUS2 || M5STACKCORE2
+#if M5STICKC || M5STICKCPLUS || M5STICKCPLUS2 || M5STICKS3 || M5STACKCORE2 || M5TAB
     #define USE_M5 1
 #endif
 
-#if USE_HUB75
+#if USE_HUB75 || USE_M5LCD
     #ifndef USE_MATRIX
         #define USE_MATRIX 1
     #endif
 #endif
 
 
-#if USE_M5
-#include "M5Unified.h"
-#endif
 #define EFFECT_CROSS_FADE_TIME 1200.0    // How long for an effect to ramp brightness fader down and back during effect change
 
 // Thread priorities
@@ -192,8 +225,7 @@
 // #define SOCKET_CORE             1
 // #define REMOTE_CORE             1
 
-// Some "Reliability Rules"
-// Drawing must be on Core 1 if using SmartMatrix unless you specify SMARTMATRIX_OPTIONS_ESP32_CALC_TASK_CORE_1
+// Keep drawing on Core 1 so the render workload remains isolated from audio.
 
 #define DRAWING_CORE            1
 #define NET_CORE                1
@@ -204,12 +236,11 @@
 #define SOCKET_CORE             1
 #define REMOTE_CORE             1
 #define JSONWRITER_CORE         0
-#define COLORDATA_CORE          1
+#define COLORDATA_CORE          0
 
 #define FASTLED_INTERNAL            1   // Suppresses the compilation banner from FastLED
 #define __STDC_FORMAT_MACROS
 
-extern RemoteDebug Debug;           // Let everyone in the project know about it.  If you don't have it, delete this
 
 // Project Configuration
 //
@@ -230,6 +261,7 @@ extern RemoteDebug Debug;           // Let everyone in the project know about it
     #include "custom_globals.h"
 
 #endif
+
 // This is a simple demo configuration used when no other project is defined; it's only purpose is
 // to serve as a build to be run for [all-deps]
 
@@ -258,38 +290,117 @@ extern RemoteDebug Debug;           // Let everyone in the project know about it
 #ifndef ENABLE_AUDIO
     #define ENABLE_AUDIO            0
 #endif
-#ifndef ENABLE_WIFI
-    #define ENABLE_WIFI             1   // Connect to WiFi
+
+// Check for nonsensical network configurations
+#if !ENABLE_WIFI
+    #if defined(ENABLE_WEBSERVER) && ENABLE_WEBSERVER
+        #error "ENABLE_WEBSERVER requires ENABLE_WIFI"
+    #endif
+    #if defined(ENABLE_NTP) && ENABLE_NTP
+        #error "ENABLE_NTP requires ENABLE_WIFI"
+    #endif
+    #if defined(ENABLE_OTA) && ENABLE_OTA
+        #error "ENABLE_OTA requires ENABLE_WIFI"
+    #endif
+    #if defined(INCOMING_WIFI_ENABLED) && INCOMING_WIFI_ENABLED
+        #error "INCOMING_WIFI_ENABLED requires ENABLE_WIFI"
+    #endif
+    #if defined(COLORDATA_SERVER_ENABLED) && COLORDATA_SERVER_ENABLED
+        #error "COLORDATA_SERVER_ENABLED requires ENABLE_WIFI"
+    #endif
 #endif
+
 #ifndef INCOMING_WIFI_ENABLED
-    #define INCOMING_WIFI_ENABLED   1   // Accepting incoming color data and commands
+    #if ENABLE_WIFI
+        #define INCOMING_WIFI_ENABLED   1   // Accepting incoming color data and commands
+    #else
+        #define INCOMING_WIFI_ENABLED   0
+    #endif
 #endif
 #ifndef TIME_BEFORE_LOCAL
     #define TIME_BEFORE_LOCAL       1   // How many seconds before the lamp times out and shows local content
 #endif
 #ifndef ENABLE_NTP
-    #define ENABLE_NTP              1   // Set the clock from the web
+    #if ENABLE_WIFI
+        #define ENABLE_NTP              1   // Set the clock from the web
+    #else
+        #define ENABLE_NTP              0
+    #endif
 #endif
 #ifndef ENABLE_OTA
-    #define ENABLE_OTA              1
+    #if ENABLE_WIFI
+//        #define ENABLE_OTA              1
+//    #else
+        #define ENABLE_OTA              0
+    #endif
 #endif
 #ifndef ENABLE_WEBSERVER
-    #define ENABLE_WEBSERVER        1   // Turn on the internal webserver
+    #if ENABLE_WIFI
+        #define ENABLE_WEBSERVER        1   // Turn on the internal webserver
+    #else
+        #define ENABLE_WEBSERVER        0
+    #endif
 #endif
 
 #ifndef LED_PIN0
     #define LED_PIN0         5
 #endif
 
+#if USE_STRIP && NUM_CHANNELS >= 2 && !defined(LED_PIN1)
+    #error "NUM_CHANNELS >= 2 requires LED_PIN1 for strip output"
+#endif
+#if USE_STRIP && NUM_CHANNELS >= 3 && !defined(LED_PIN2)
+    #error "NUM_CHANNELS >= 3 requires LED_PIN2 for strip output"
+#endif
+#if USE_STRIP && NUM_CHANNELS >= 4 && !defined(LED_PIN3)
+    #error "NUM_CHANNELS >= 4 requires LED_PIN3 for strip output"
+#endif
+#if USE_STRIP && NUM_CHANNELS >= 5 && !defined(LED_PIN4)
+    #error "NUM_CHANNELS >= 5 requires LED_PIN4 for strip output"
+#endif
+#if USE_STRIP && NUM_CHANNELS >= 6 && !defined(LED_PIN5)
+    #error "NUM_CHANNELS >= 6 requires LED_PIN5 for strip output"
+#endif
+#if USE_STRIP && NUM_CHANNELS >= 7 && !defined(LED_PIN6)
+    #error "NUM_CHANNELS >= 7 requires LED_PIN6 for strip output"
+#endif
+#if USE_STRIP && NUM_CHANNELS >= 8 && !defined(LED_PIN7)
+    #error "NUM_CHANNELS >= 8 requires LED_PIN7 for strip output"
+#endif
+
+#if USE_APA102 && NUM_CHANNELS >= 1 && !defined(LED_CLOCK_PIN0)
+    #error "APA102 channel 0 requires LED_CLOCK_PIN0"
+#endif
+#if USE_APA102 && NUM_CHANNELS >= 2 && !defined(LED_CLOCK_PIN1)
+    #error "APA102 channel 1 requires LED_CLOCK_PIN1"
+#endif
+#if USE_APA102 && NUM_CHANNELS >= 3 && !defined(LED_CLOCK_PIN2)
+    #error "APA102 channel 2 requires LED_CLOCK_PIN2"
+#endif
+#if USE_APA102 && NUM_CHANNELS >= 4 && !defined(LED_CLOCK_PIN3)
+    #error "APA102 channel 3 requires LED_CLOCK_PIN3"
+#endif
+#if USE_APA102 && NUM_CHANNELS >= 5 && !defined(LED_CLOCK_PIN4)
+    #error "APA102 channel 4 requires LED_CLOCK_PIN4"
+#endif
+#if USE_APA102 && NUM_CHANNELS >= 6 && !defined(LED_CLOCK_PIN5)
+    #error "APA102 channel 5 requires LED_CLOCK_PIN5"
+#endif
+#if USE_APA102 && NUM_CHANNELS >= 7 && !defined(LED_CLOCK_PIN6)
+    #error "APA102 channel 6 requires LED_CLOCK_PIN6"
+#endif
+#if USE_APA102 && NUM_CHANNELS >= 8 && !defined(LED_CLOCK_PIN7)
+    #error "APA102 channel 7 requires LED_CLOCK_PIN7"
+#endif
+
+#ifndef WIFI_ACTIVITY_PIN
+    #define WIFI_ACTIVITY_PIN -1
+#endif
+
 #ifndef PROJECT_NAME
 #define PROJECT_NAME        "Mesmerizer"
 #endif
 
-#if USE_HUB75
-#include "MatrixHardware_ESP32_Custom.h"
-#define SM_INTERNAL     // Silence build messages from their header
-#include <SmartMatrix.h>
-#endif
 
 #if ENABLE_AUDIOSERIAL
 #ifndef SERIAL_PINRX
@@ -329,9 +440,9 @@ extern RemoteDebug Debug;           // Let everyone in the project know about it
     #endif
 #endif
 
-#ifndef ENABLE_OTA
-#define ENABLE_OTA              1   // Listen for over the air update to the flash
-#endif
+//#ifndef ENABLE_OTA
+//#define ENABLE_OTA              1   // Listen for over the air update to the flash
+//#endif
 
 #ifndef ENABLE_ESPNOW
 #define ENABLE_ESPNOW           0   // Listen for ESPNOW packets
@@ -376,7 +487,11 @@ extern RemoteDebug Debug;           // Let everyone in the project know about it
 #endif
 
 #ifndef COLOR_ORDER
-#define COLOR_ORDER EOrder::GRB
+    #if USE_APA102
+        #define COLOR_ORDER EOrder::BGR
+    #else
+        #define COLOR_ORDER EOrder::GRB
+    #endif
 #endif
 
 // Define fan ordering for drawing into the fan directionally
@@ -613,7 +728,7 @@ extern RemoteDebug Debug;           // Let everyone in the project know about it
 // Items with rings must provide a table indicating how big each ring is.  If an insulator had 60 LEDs grouped
 // into rings of 30, 20, and 10, you'd have (NUM_RINGS = 3) and this table would contain (30, 20, 10).
 
-extern DRAM_ATTR const int g_aRingSizeTable[];
+extern const int g_aRingSizeTable[];
 
 #ifndef MICROS_PER_SECOND
     #define MICROS_PER_SECOND 1000000
@@ -634,8 +749,16 @@ extern DRAM_ATTR const int g_aRingSizeTable[];
 #define M5STICKCPLUS2 0
 #endif
 
+#ifndef M5STICKS3
+#define M5STICKS3 0
+#endif
+
 #ifndef M5STACKCORE2
 #define M5STACKCORE2 0
+#endif
+
+#ifndef M5TAB
+#define M5TAB 0
 #endif
 
 #ifndef COLORDATA_SERVER_ENABLED
@@ -662,25 +785,29 @@ extern DRAM_ATTR const int g_aRingSizeTable[];
   #endif
 #endif
 
+#define WEB_SOCKETS_ANY_ENABLED (COLORDATA_WEB_SOCKET_ENABLED || EFFECTS_WEB_SOCKET_ENABLED)
+
 // Microphone
 //
 // The M5 mic is on Pin34, but when I wire up my own microphone module I usually put it on pin 36.
 
 #if ENABLE_AUDIO
-    #ifndef INPUT_PIN
+    #ifndef AUDIO_INPUT_PIN
         #if TTGO
-            #define INPUT_PIN (36)
+            #define AUDIO_INPUT_PIN (36)
         #elif ELECROW
-            #define INPUT_PIN (41)
+            #define AUDIO_INPUT_PIN (41)
         #elif USE_M5
-            #define INPUT_PIN (34)
+            #define AUDIO_INPUT_PIN (34)
             #define IO_PIN (0)
         #else
-            #define INPUT_PIN (36)    // Audio line input, ADC #1, input line 0 (GPIO pin 36)
+            #define AUDIO_INPUT_PIN (36)    // Audio line input, ADC #1, input line 0 (GPIO pin 36)
         #endif
     #endif
 #else
-    #define INPUT_PIN 0
+    #ifndef AUDIO_INPUT_PIN
+        #define AUDIO_INPUT_PIN 0
+    #endif
 #endif
 
 #ifndef IR_REMOTE_PIN
@@ -700,7 +827,7 @@ extern DRAM_ATTR const int g_aRingSizeTable[];
   #endif
 
   #ifndef I2S_DATA_PIN
-    #define I2S_DATA_PIN     INPUT_PIN
+    #define I2S_DATA_PIN     AUDIO_INPUT_PIN
   #endif
 #endif
 
@@ -719,198 +846,9 @@ extern DRAM_ATTR const int g_aRingSizeTable[];
 //
 // Headers that are only included when certain features are enabled
 
-
-// FPS
-//
-// Given a time value for when the last frame took place and the current timestamp returns the number of
-// frames per second, as low as 0.  Never exceeds 999 so you can make some width assumptions.
-
-inline int FPS(unsigned long duration, uint32_t perSecond = MILLIS_PER_SECOND)
-{
-    if (duration == 0)
-        return 999;
-
-    float fpsf = 1.0f / (duration / (float)perSecond);
-    int FPS = (int)fpsf;
-    if (FPS > 999)
-        FPS = 999;
-    return FPS;
-}
-
-// str_snprintf
-//
-// va-args style printf that returns the formatted string as a result
-
-// Let compiler warn if our arguments don't match.
-inline String str_sprintf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-
-inline String str_sprintf(const char *fmt, ...)
-{
-    va_list args;
-    va_start(args, fmt);
-
-    va_list args_copy;
-    va_copy(args_copy, args);
-
-    // BUGBUG: Investigate a vasprintf here and String::copy() to get move semantics
-    // on the return.
-    // Could Save one complete format, a copy, and an alloc and we're called a
-    // few times a second.
-    int requiredLen = vsnprintf(nullptr, 0, fmt, args) + 1;
-    va_end(args);
-
-    if (requiredLen <= 0) {
-        va_end(args_copy);
-        return {};
-    }
-
-    std::unique_ptr<char []> str = std::make_unique<char []>(requiredLen);
-    vsnprintf(str.get(), requiredLen, fmt, args_copy);
-    va_end(args_copy);
-
-    String retval;
-    retval.reserve(requiredLen); // At least saves one scan of the buffer.
-
-    retval = str.get();
-    return retval;
-}
-
+#include "interfaces.h"
+#include "logger.h"
 #include "types.h"
-
-// C Helpers
-//
-// Simple inline utility functions like random numbers, mapping, conversion, etc
-
-#include <random>
-#include <type_traits>
-#include <iterator>
-
-template <typename T>
-inline static T random_range(T lower, T upper)
-{
-#if USE_STRONG_RAND
-    static_assert(std::is_arithmetic<T>::value, "Template argument must be numeric type");
-
-    static std::random_device rd;
-    static std::mt19937 gen(rd());
-
-    if constexpr (std::is_integral<T>::value) {
-        std::uniform_int_distribution<T> distrib(lower, upper);
-        return distrib(gen);
-    } else if constexpr (std::is_floating_point<T>::value) {
-        std::uniform_real_distribution<T> distrib(lower, upper);
-        return distrib(gen);
-    }
-#else
-    static bool seeded = [&] { srand(time(nullptr)); return true; } ();
-
-    if constexpr (std::is_integral<T>::value) {
-        return std::rand() % (upper - lower + 1) + lower;
-    } else if constexpr (std::is_floating_point<T>::value) {
-        return std::rand() / (RAND_MAX / (upper - lower)) + lower;
-    } else {
-        static_assert(std::is_integral<T>::value || std::is_floating_point<T>::value, "Template argument must be numeric type");
-    }
-#endif
-}
-
-inline uint64_t ULONGFromMemory(const uint8_t * payloadData)
-{
-    return  (uint64_t)payloadData[7] << 56  |
-            (uint64_t)payloadData[6] << 48  |
-            (uint64_t)payloadData[5] << 40  |
-            (uint64_t)payloadData[4] << 32  |
-            (uint64_t)payloadData[3] << 24  |
-            (uint64_t)payloadData[2] << 16  |
-            (uint64_t)payloadData[1] << 8   |
-            (uint64_t)payloadData[0];
-}
-
-inline uint32_t DWORDFromMemory(const uint8_t * payloadData)
-{
-    return  (uint32_t)payloadData[3] << 24  |
-            (uint32_t)payloadData[2] << 16  |
-            (uint32_t)payloadData[1] << 8   |
-            (uint32_t)payloadData[0];
-}
-
-inline uint16_t WORDFromMemory(const uint8_t * payloadData)
-{
-    return  (uint16_t)payloadData[1] << 8   |
-            (uint16_t)payloadData[0];
-}
-
-// SetSocketBlockingEnabled
-//
-// In blocking mode, socket API calls wait until the operation is complete before returning control to the application.
-// For example, a call to the send() function won't return until all data has been sent. This can lead to the application
-// hanging if the operation takes a long time.
-
-// In contrast, in non-blocking mode, socket API calls return immediately. If an operation cannot be completed immediately, the function returns an error (usually EWOULDBLOCK or EAGAIN). The application can then decide how to handle the situation, such as by retrying the operation later. This provides more control and can make the application more responsive. However, it also requires more sophisticated programming, as the application must be prepared to handle these error conditions.
-
-inline bool SetSocketBlockingEnabled(int fd, bool blocking)
-{
-   if (fd < 0) return false;
-
-   int flags = fcntl(fd, F_GETFL, 0);
-   if (flags == -1) return false;
-   flags = blocking ? (flags & ~O_NONBLOCK) : (flags | O_NONBLOCK);
-   return (fcntl(fd, F_SETFL, flags) == 0) ? true : false;
-}
-
-// formatSize
-//
-// Returns a string with the size formatted in a human-readable format.
-// For example, 1024 becomes "1K", 1000*1000 becomes "1M", etc.
-// It pains me not to use 1024, but such are the times we live in.
-
-inline String formatSize(size_t size, size_t threshold = 1000)
-{
-    // If the size is above the threshold, we want a precision of 2 to show more accurate value
-    const int precision = size < threshold ? 0 : 2;
-
-    const char* suffixes[] = {"", "K", "M", "G", "T", "P", "E", "Z"};
-    size_t suffixIndex = 0;
-    double sizeDouble = static_cast<double>(size);
-
-    while (sizeDouble >= threshold && suffixIndex < (sizeof(suffixes) / sizeof(suffixes[0])) - 1)
-    {
-        sizeDouble /= 1000;
-        ++suffixIndex;
-    }
-
-    std::ostringstream oss;
-    oss << std::fixed << std::setprecision(precision) << sizeDouble << suffixes[suffixIndex];
-    std::string result = oss.str();  // Store the result to avoid dangling pointer
-    return String(result.c_str());
-}
-
-
-// to_array
-//
-// Because the ESP32 compiler, as of this writing, doesn't have std::to_array, we provide our own (davepl).
-// BUGBUG: Once we have compiler support we should use the C++20 versions
-
-template <typename T, std::size_t N>
-constexpr std::array<T, N> to_array(const T (&arr)[N]) {
-    std::array<T, N> result{};
-    for (std::size_t i = 0; i < N; ++i) {
-        result[i] = arr[i];
-    }
-    return result;
-}
-
-// Provide a single-parameter std::accumulate overload for ranges/containers
-// This allows: auto total = std::accumulate(container);
-template <typename Range>
-inline auto accumulate(const Range& r)
-    -> std::remove_cv_t<std::remove_reference_t<decltype(*std::begin(r))>>
-{
-    using T = std::remove_cv_t<std::remove_reference_t<decltype(*std::begin(r))>>;
-    T total{};
-    for (const auto& v : r) total += v;
-    return total;
-}
 
 // 16-bit (5:6:5) color definitions for common colors
 
@@ -923,17 +861,6 @@ inline auto accumulate(const Range& r)
 #define YELLOW16    0xFFE0
 #define WHITE16     0xFFFF
 
-// Main includes
-
-#include "gfxbase.h"                            // GFXBase drawing interface
-#include "socketserver.h"                       // Incoming WiFi data connections
-#include "ws281xgfx.h"                           // Essential drawing code for strips
-#include "ledstripeffect.h"                     // Defines base led effect classes
-#include "ntptimeclient.h"                      // setting the system clock from ntp
-#include "effectmanager.h"                      // For g_EffectManager
-#include "ledbuffer.h"                          // Buffer manager for strip
-#include "colordata.h"                          // color palettes
-
 #if USE_TFTSPI
     #define DISABLE_ALL_LIBRARY_WARNINGS 1
     // If the project provides its own TFT_eSPI setup via USER_SETUP_LOADED
@@ -942,6 +869,6 @@ inline auto accumulate(const Range& r)
     #if TTGO && !defined(USER_SETUP_LOADED)
         #include <User_Setups/Setup25_TTGO_T_Display.h>
     #endif
-    #include <TFT_eSPI.h>
     #include <SPI.h>
+    #include <TFT_eSPI.h>
 #endif

@@ -1,3 +1,5 @@
+#pragma once
+
 //+--------------------------------------------------------------------------
 //
 // File:        PatternLife.h
@@ -152,58 +154,60 @@ private:
             }
         }
 
-        void move()
+        void move(uint8_t horizontalDistance, uint8_t verticalDistance)
         {
             switch (direction)
             {
             case UP:
-                pixels[0].y = (pixels[0].y + 1) % MATRIX_HEIGHT;
+                pixels[0].y = (pixels[0].y + verticalDistance) % MATRIX_HEIGHT;
                 break;
             case LEFT:
-                pixels[0].x = (pixels[0].x + 1) % MATRIX_WIDTH;
+                pixels[0].x = (pixels[0].x + horizontalDistance) % MATRIX_WIDTH;
                 break;
             case DOWN:
-                pixels[0].y = pixels[0].y == 0 ? MATRIX_HEIGHT - 1 : pixels[0].y - 1;
+                pixels[0].y =
+                    (pixels[0].y + MATRIX_HEIGHT - verticalDistance % MATRIX_HEIGHT) % MATRIX_HEIGHT;
                 break;
             case RIGHT:
-                pixels[0].x = pixels[0].x == 0 ? MATRIX_WIDTH - 1 : pixels[0].x - 1;
+                pixels[0].x =
+                    (pixels[0].x + MATRIX_WIDTH - horizontalDistance % MATRIX_WIDTH) % MATRIX_WIDTH;
                 break;
             }
         }
 
-        void draw(std::shared_ptr<GFXBase> graphics, CRGB colors[SNAKE_LENGTH])
+        void draw(GFXBase& graphics, CRGB colors[SNAKE_LENGTH])
         {
             for (uint8_t i = 0; i < SNAKE_LENGTH; i++)
-                graphics->leds[XY(pixels[i].x, pixels[i].y)] = colors[i] %= (255 - i * (255 / SNAKE_LENGTH / 4));
+                graphics.leds[XY(pixels[i].x, pixels[i].y)] = colors[i] %= (255 - i * (255 / SNAKE_LENGTH / 4));
 
             uint8_t m = random(20, 100);
-            graphics->leds[XY(pixels[SNAKE_LENGTH - 1].x, pixels[SNAKE_LENGTH - 1].y)] = CRGB(0, m, 0); // End tail with random dark green
-            graphics->leds[XY(pixels[0].x, pixels[0].y)] = CRGB::White;                                 // Head end bright white dot
+            graphics.leds[XY(pixels[SNAKE_LENGTH - 1].x, pixels[SNAKE_LENGTH - 1].y)] = CRGB(0, m, 0); // End tail with random dark green
+            graphics.leds[XY(pixels[0].x, pixels[0].y)] = CRGB::White;                                 // Head end bright white dot
         }
     };
 
     static const int snakeCount = 20;
-    Path *snakes;
+    allocated_unique_ptr<Path[]> snakes;
 
     void construct()
     {
-        snakes = (Path *) PreferPSRAMAlloc(snakeCount * sizeof(Path)); //
+        snakes = make_unique_psram<Path[]>(snakeCount);
     }
 
 public:
 
     PatternCircuit() : EffectWithId<PatternCircuit>("Circuit") { construct(); }
     PatternCircuit(const JsonObjectConst& jsonObject) : EffectWithId<PatternCircuit>(jsonObject) { construct(); }
-    ~PatternCircuit() { free(snakes); }
+    ~PatternCircuit() = default;
 
-    unsigned long msStart;
+    unsigned long msStart = 0;
 
-    void start()
+    void Start() override
     {
         for (int i = 0; i < snakeCount; i++)
             snakes[i].reset();
         msStart = millis();
-        g()->Clear();
+        g().Clear();
     }
 
     void Draw() override
@@ -211,15 +215,22 @@ public:
         // Reset after 20 seconds
         const auto kResetEveryNSeconds = 20;
         if (millis() - msStart > kResetEveryNSeconds * MILLIS_PER_SECOND)
-            start();
+            Start();
 
-        for (int i = 0; i < MATRIX_WIDTH * MATRIX_HEIGHT / 10; i++)
-        {
-            g()->leds[XY(random(0, MATRIX_WIDTH), random(0, MATRIX_HEIGHT))].fadeToBlackBy(32);
-        }
+        // Fading 10% of the pixels by 32 has an average whole-frame fade of
+        // about 3, but selecting those pixels required thousands of random()
+        // calls per frame on larger matrices. A sequential fade is visually
+        // equivalent and substantially faster.
+        g().DimAll(252);
 
-        // fill_palette(colors, SNAKE_LENGTH, initialHue++, 5, graphics->currentPalette, 255, LINEARBLEND);
+        // fill_palette(colors, SNAKE_LENGTH, initialHue++, 5, graphics.currentPalette, 255, LINEARBLEND);
         fill_palette(colors, SNAKE_LENGTH, 0, 4, ForestColors_p, 255, LINEARBLEND);
+        constexpr uint8_t kReferenceMatrixWidth = 64;
+        constexpr uint8_t kReferenceMatrixHeight = 32;
+        constexpr uint8_t kHorizontalMovementStep =
+            std::max(1, (MATRIX_WIDTH + kReferenceMatrixWidth / 2) / kReferenceMatrixWidth);
+        constexpr uint8_t kVerticalMovementStep =
+            std::max(1, (MATRIX_HEIGHT + kReferenceMatrixHeight / 2) / kReferenceMatrixHeight);
         for (int i = 0; i < snakeCount; i++)
         {
             Path *path = &snakes[i];
@@ -231,7 +242,7 @@ public:
                 path->newDirection();
             }
 
-            path->move();
+            path->move(kHorizontalMovementStep, kVerticalMovementStep);
             path->draw(g(), colors);
         }
     }

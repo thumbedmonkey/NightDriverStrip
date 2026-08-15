@@ -1,0 +1,145 @@
+//+--------------------------------------------------------------------------
+//
+// File:        deviceconfig_validation.cpp
+//
+// NightDriverStrip - (c) 2018 Plummer's Software LLC.  All Rights Reserved.
+//
+// This file is part of deviceconfig.cpp; see that file header for additional context.
+//
+// Split scope: DeviceConfig value validation routines.
+//---------------------------------------------------------------------------
+
+
+#include "globals.h"
+
+#include "deviceconfig.h"
+#include "deviceconfig_internal.h"
+
+SuccessResultWithMessage DeviceConfig::ValidateTopology(uint16_t width, uint16_t height, bool serpentine) const
+{
+    if (width == 0 || height == 0)
+        return { false, "matrix dimensions must be greater than zero" };
+
+    const size_t requestedLEDCount = static_cast<size_t>(width) * height;
+    const size_t compiledLEDCount = GetCompiledLEDCount();
+    if (requestedLEDCount > compiledLEDCount)
+    {
+        return {
+            false,
+            String("Matrix dimensions ") + width + " x " + height
+                + " require " + static_cast<unsigned long>(requestedLEDCount)
+                + " LEDs, but this firmware was compiled for "
+                + static_cast<unsigned long>(compiledLEDCount)
+                + ". Lower width/height or flash a build compiled for more LEDs."
+        };
+    }
+
+    if (IsFixedMatrixBuild())
+    {
+        if (width != GetCompiledMatrixWidth() || height != GetCompiledMatrixHeight())
+            return { false, DeviceConfigInternal::RecompileNeededMessage() };
+
+        if (serpentine != GetCompiledMatrixSerpentine())
+            return { false, DeviceConfigInternal::RecompileNeededMessage() };
+    }
+
+    return { true, "" };
+}
+
+SuccessResultWithMessage DeviceConfig::ValidateOutputDriver(OutputDriver driver) const
+{
+    if (driver != GetCompiledOutputDriver())
+        return { false, DeviceConfigInternal::RecompileNeededMessage() };
+
+    return { true, "" };
+}
+
+SuccessResultWithMessage DeviceConfig::ValidateStripSettings(size_t channelCount,
+                                                             const std::array<int8_t, NUM_CHANNELS>& dataPins,
+                                                             const std::array<int8_t, NUM_CHANNELS>& clockPins,
+                                                             WS281xColorOrder colorOrder) const
+{
+    if (channelCount == 0)
+        return { false, "channel count must be greater than zero" };
+
+    if (channelCount > GetCompiledChannelCount())
+        return { false, DeviceConfigInternal::RecompileNeededMessage() };
+
+    if (IsFixedMatrixBuild())
+    {
+        if (channelCount != GetCompiledChannelCount())
+            return { false, DeviceConfigInternal::RecompileNeededMessage() };
+
+        if (dataPins != GetCompiledWS281xPins())
+            return { false, DeviceConfigInternal::RecompileNeededMessage() };
+
+        if (clockPins != GetCompiledAPA102ClockPins())
+            return { false, DeviceConfigInternal::RecompileNeededMessage() };
+
+        if (colorOrder != GetCompiledWS281xColorOrder())
+            return { false, DeviceConfigInternal::RecompileNeededMessage() };
+
+        return { true, "" };
+    }
+
+    for (size_t i = 0; i < channelCount; ++i)
+    {
+        if (dataPins[i] < 0)
+            return { false, "active channels require valid GPIO pins" };
+
+        if (!GPIO_IS_VALID_OUTPUT_GPIO(static_cast<gpio_num_t>(dataPins[i])))
+            return { false, "strip data pins must be valid output GPIOs" };
+
+        for (size_t j = i + 1; j < channelCount; ++j)
+        {
+            if (dataPins[i] == dataPins[j])
+                return { false, "strip data pins must be unique" };
+        }
+    }
+
+    if (GetCompiledOutputDriver() == OutputDriver::APA102)
+    {
+        for (size_t i = 0; i < channelCount; ++i)
+        {
+            if (clockPins[i] < 0)
+                return { false, "APA102 channels require valid clock GPIO pins" };
+
+            if (!GPIO_IS_VALID_OUTPUT_GPIO(static_cast<gpio_num_t>(clockPins[i])))
+                return { false, "APA102 clock pins must be valid output GPIOs" };
+
+            if (clockPins[i] == dataPins[i])
+                return { false, "APA102 data and clock pins must be different" };
+
+            for (size_t j = i + 1; j < channelCount; ++j)
+            {
+                if (clockPins[i] == clockPins[j])
+                    return { false, "APA102 clock pins must be unique" };
+
+                if (clockPins[i] == dataPins[j] || dataPins[i] == clockPins[j])
+                    return { false, "APA102 data and clock pins must be unique" };
+            }
+        }
+    }
+
+    return { true, "" };
+}
+
+SuccessResultWithMessage DeviceConfig::ValidateRuntimeConfig(const RuntimeConfig& config) const
+{
+    auto [driverValid, driverMessage] = ValidateOutputDriver(config.outputs.driver);
+    if (!driverValid)
+        return { false, driverMessage };
+
+    auto [topologyValid, topologyMessage] = ValidateTopology(config.topology.width, config.topology.height, config.topology.serpentine);
+    if (!topologyValid)
+        return { false, topologyMessage };
+
+    auto [stripValid, stripMessage] = ValidateStripSettings(config.outputs.channelCount,
+                                                            config.outputs.outputPins,
+                                                            config.outputs.clockPins,
+                                                            config.outputs.colorOrder);
+    if (!stripValid)
+        return { false, stripMessage };
+
+    return { true, "" };
+}

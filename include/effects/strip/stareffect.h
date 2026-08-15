@@ -1,3 +1,4 @@
+#pragma once
 //+--------------------------------------------------------------------------
 //
 // File:        StarEffect.h
@@ -29,11 +30,13 @@
 //
 //---------------------------------------------------------------------------
 
-#pragma once
 
+#include <algorithm>
 #include <deque>
+#include <type_traits>
 
 #include "particles.h"
+#include "random_utils.h"
 
 const int cMaxNewStarsPerFrame = 144;
 const int cMaxStars = 500;
@@ -365,6 +368,51 @@ class StarEffectBase : public EffectWithId<StarEffectBase<StarType, TEffect>>
     float                       _blurFactor;
     float                       _musicFactor;
     CRGB                         _skyColor;
+    uint32_t                    _lastMusicBeatSequence = 0;
+    uint32_t                    _lastMusicNearBeatSequence = 0;
+    bool                         _useBeatColorCoding = false;
+    std::deque<int16_t>          _pendingMusicStarColors;
+
+    // Effect name is referenced by the constructors regardless of ENABLE_AUDIO so it must
+    // remain visible on audio-less builds (demo). The indices below are only used by the
+    // audio-driven beat path and stay behind the guard.
+    static constexpr const char* kRgbMusicBlendStarsName = "RGB Music Blend Stars";
+
+    #if ENABLE_AUDIO
+    static constexpr int16_t kMusicStarRandomIndex = -1;
+    static constexpr uint8_t kMusicStarRedIndex = 0;
+    static constexpr uint8_t kMusicStarGreenIndex = 16;
+    static constexpr uint8_t kMusicStarBlueIndex = 32;
+
+    void QueueMusicStarsForBeat(const BeatInfo& beat, bool acceptedBeat)
+    {
+        if constexpr (std::is_same_v<StarType, MusicStar>)
+        {
+            const float confidence = std::clamp(beat.confidence, 0.0f, 1.5f);
+            const float strength = std::clamp(beat.strength, 0.0f, 2.5f);
+            const float scale = acceptedBeat ? 1.0f : 0.45f;
+            const bool strongBeat = acceptedBeat && strength >= 2.40f && confidence >= 1.20f;
+            const float majorBonus = strongBeat ? 8.0f : 0.0f;
+            const size_t minStars = acceptedBeat ? 5U : 1U;
+            const size_t maxStars = acceptedBeat ? 36U : 14U;
+            const int16_t colorIndex = _useBeatColorCoding
+                ? (acceptedBeat
+                    ? (strongBeat ? kMusicStarRedIndex : kMusicStarGreenIndex)
+                    : kMusicStarBlueIndex)
+                : kMusicStarRandomIndex;
+            const size_t stars = std::clamp<size_t>(
+                static_cast<size_t>((acceptedBeat ? 4.0f : 1.0f)
+                    + confidence * 8.0f * scale
+                    + strength * 8.0f * scale
+                    + majorBonus),
+                minStars,
+                maxStars);
+
+            for (size_t i = 0; i < stars && _pendingMusicStarColors.size() < cMaxNewStarsPerFrame; ++i)
+                _pendingMusicStarColors.push_back(colorIndex);
+        }
+    }
+    #endif
 
   public:
 
@@ -385,7 +433,8 @@ class StarEffectBase : public EffectWithId<StarEffectBase<StarType, TEffect>>
         _maxSpeed(maxSpeed),
         _blurFactor(blurFactor),
         _musicFactor(musicFactor),
-        _skyColor(skyColor)
+        _skyColor(skyColor),
+        _useBeatColorCoding(strName == kRgbMusicBlendStarsName)
     {
     }
 
@@ -398,7 +447,8 @@ class StarEffectBase : public EffectWithId<StarEffectBase<StarType, TEffect>>
         _maxSpeed(jsonObject[PTY_MAXSPEED]),
         _blurFactor(jsonObject[PTY_BLUR]),
         _musicFactor(jsonObject["msf"]),
-        _skyColor(jsonObject[PTY_COLOR].as<CRGB>())
+        _skyColor(jsonObject[PTY_COLOR].as<CRGB>()),
+        _useBeatColorCoding(jsonObject["fn"].as<String>() == kRgbMusicBlendStarsName)
     {
     }
 
@@ -434,28 +484,85 @@ class StarEffectBase : public EffectWithId<StarEffectBase<StarType, TEffect>>
 
     virtual void CreateStars()
     {
-    #if ENABLE_AUDIO
+        #if ENABLE_AUDIO
+            // MusicStar creation is driven exclusively from beat callbacks. Draw-time
+            // polling and VU-based probability scaling are intentionally bypassed.
+            if constexpr (std::is_same_v<StarType, MusicStar>)
+            {
+                while (!_pendingMusicStarColors.empty() && _allParticles.size() < cMaxStars)
+                {
+                    StarType newstar(_palette, _blendType, _maxSpeed * std::max(1.0f, _musicFactor), _starSize);
+                    if (_pendingMusicStarColors.front() >= 0)
+                        newstar.SetColorIndex(static_cast<uint8_t>(_pendingMusicStarColors.front()));
+                    newstar._iPos = (int) random_range(0U, LEDStripEffect::_cLEDs - 1 - starWidth);
+                    _allParticles.push_back(newstar);
+                    _pendingMusicStarColors.pop_front();
+                }
+                return;
+            }
+        #endif
 
         for (int i = 0; i < cMaxNewStarsPerFrame; i++)
         {
-            double prob = _newStarProbability;
+            float prob = _newStarProbability / 100.0f;
+            float speedMultiplier = 1.0f;
 
-            prob = (prob / 100) + (g_Analyzer.VURatio() - 1.0) * _musicFactor;
-
-            constexpr auto kProbabilitySpan = 1.0;
-
-            if (g_Analyzer.VU() > 0)
-            {
-                if (random_range(0.0, kProbabilitySpan) < g_Values.AppTime.LastFrameTime() * prob)
+            #if ENABLE_AUDIO
+                // If we have audio enabled, modulate probability and speed based on the music.
+                // Only apply modulation when there is actual sound (VU > 0) — otherwise fall back to base probability.
+                if (g_Analyzer.VU() > 0)
                 {
-                    StarType newstar(_palette, _blendType, _maxSpeed * _musicFactor, _starSize);
-                    // This always starts stars on even pixel boundaries so they look like the desired width if not moving
-                    newstar._iPos = (int) random_range(0U, LEDStripEffect::_cLEDs - 1 - starWidth);
-                    _allParticles.push_back(newstar);
+                    prob += (g_Analyzer.VURatio() - 1.0f) * _musicFactor;
+                    speedMultiplier = _musicFactor;
                 }
+            #endif
+
+            // Clamp probability to a sane range to avoid negative or runaway values
+            prob = std::clamp(prob, 0.0f, 1.0f);
+
+            constexpr auto kProbabilitySpan = 1.0f;
+
+            // Ensure probability is positive before rolling dice
+            if (prob > 0.0f && (random_range(0.0f, kProbabilitySpan) < g_Values.AppTime.LastFrameTime() * prob))
+            {
+                StarType newstar(_palette, _blendType, _maxSpeed * speedMultiplier, _starSize);
+                // This always starts stars on even pixel boundaries so they look like the desired width if not moving
+                newstar._iPos = (int) random_range(0U, LEDStripEffect::_cLEDs - 1 - starWidth);
+                _allParticles.push_back(newstar);
             }
         }
-    #endif
+    }
+
+    void OnBeat(const BeatInfo& beat) override
+    {
+        LEDStripEffect::OnBeat(beat);
+
+        #if ENABLE_AUDIO
+            if constexpr (std::is_same_v<StarType, MusicStar>)
+            {
+                if (beat.sequence == 0 || beat.sequence == _lastMusicBeatSequence)
+                    return;
+
+                _lastMusicBeatSequence = beat.sequence;
+                QueueMusicStarsForBeat(beat, true);
+            }
+        #endif
+    }
+
+    void OnNearBeat(const BeatInfo& beat) override
+    {
+        LEDStripEffect::OnNearBeat(beat);
+
+        #if ENABLE_AUDIO
+            if constexpr (std::is_same_v<StarType, MusicStar>)
+            {
+                if (beat.sequence == 0 || beat.sequence == _lastMusicNearBeatSequence)
+                    return;
+
+                _lastMusicNearBeatSequence = beat.sequence;
+                QueueMusicStarsForBeat(beat, false);
+            }
+        #endif
     }
 
     virtual void Update()
@@ -480,8 +587,17 @@ class StarEffectBase : public EffectWithId<StarEffectBase<StarType, TEffect>>
         }
         else
         {
-            LEDStripEffect::g()->blurRows(LEDStripEffect::g()->leds, MATRIX_WIDTH, MATRIX_HEIGHT, 0, _blurFactor * 255);
-            LEDStripEffect::fadeAllChannelsToBlackBy(55 * (2.0 - g_Analyzer.VURatioFade()));
+            LEDStripEffect::g().blurRows(LEDStripEffect::g().leds, MATRIX_WIDTH, MATRIX_HEIGHT, 0, _blurFactor * 255);
+            #if ENABLE_AUDIO
+                if constexpr (std::is_same_v<StarType, MusicStar>)
+                {
+                    LEDStripEffect::fadeAllChannelsToBlackBy(55);
+                }
+                else
+            #endif
+                {
+                    LEDStripEffect::fadeAllChannelsToBlackBy(55 * (2.0 - g_Analyzer.VURatioFade()));
+                }
         }
 
         for(auto i = _allParticles.begin(); i != _allParticles.end(); i++)
@@ -499,6 +615,127 @@ class StarEffect : public StarEffectBase<StarType, StarEffect<StarType>>
 {
   public:
     using StarEffectBase<StarType, StarEffect<StarType>>::StarEffectBase;
+};
+
+// NightTwinkleEffect
+//
+// Fills the strip with a base night color, then overlays randomly triggered
+// white stars using the standard particle pre-ignition/ignition/hold/fade cycle.
+
+class NightTwinkleEffect : public EffectWithId<NightTwinkleEffect>
+{
+  protected:
+
+    class NightTwinkleStar : public ColorStar
+    {
+      public:
+        NightTwinkleStar()
+          : ColorStar(CRGB::White, 0.0f, 1.0f)
+        {
+        }
+
+        float PreignitionTime() const override { return 0.0f;  }
+        float IgnitionTime()    const override { return 0.05f; }
+        float HoldTime()        const override { return 0.10f; }
+        float FadeTime()        const override { return 0.30f; }
+    };
+
+    static constexpr const char * PTY_DENSITY = "dns";
+    static constexpr const char * PTY_STARS_PER_FRAME = "spf";
+    static constexpr float  kDefaultDensity           = 1.0f;
+    static constexpr float  kLegacyDefaultDensity     = 0.01f;
+    static constexpr size_t kDefaultStarsPerFrame     = 10;
+    static constexpr float  kReferenceLEDCount        = 144.0f;
+
+    std::deque<NightTwinkleStar> _allParticles;
+    CRGB                         _baseColor;
+    float                        _density;
+    size_t                       _starsPerFrame;
+
+    static float DensityFromJSON(const JsonObjectConst& jsonObject)
+    {
+        if (!jsonObject[PTY_DENSITY].is<float>())
+            return kDefaultDensity;
+
+        const float density = jsonObject[PTY_DENSITY].as<float>();
+        if (!jsonObject[PTY_STARS_PER_FRAME].is<size_t>())
+            return density / kLegacyDefaultDensity;
+
+        return density;
+    }
+
+    void Update()
+    {
+        while (!_allParticles.empty() && _allParticles.front().Age() >= _allParticles.front().TotalLifetime())
+            _allParticles.pop_front();
+
+        while (_allParticles.size() > cMaxStars)
+            _allParticles.pop_back();
+    }
+
+    void CreateStars()
+    {
+        const float stripScale = static_cast<float>(_cLEDs) / kReferenceLEDCount;
+        const float requestedStars = _starsPerFrame * stripScale * std::max(0.0f, _density);
+        const size_t starsToCreate = requestedStars > 0.0f
+            ? std::max<size_t>(1, static_cast<size_t>(std::round(requestedStars)))
+            : 0;
+        if (starsToCreate == 0)
+            return;
+
+        for (size_t i = 0; i < starsToCreate && _allParticles.size() < cMaxStars; ++i)
+        {
+            NightTwinkleStar star;
+            star._iPos = static_cast<float>(random_range(0U, _cLEDs - 1));
+            _allParticles.push_back(star);
+        }
+    }
+
+  public:
+
+    NightTwinkleEffect(CRGB baseColor = CRGB(0, 0, 255), float density = kDefaultDensity, size_t starsPerFrame = kDefaultStarsPerFrame)
+      : EffectWithId<NightTwinkleEffect>("NightTwinkle"),
+        _baseColor(baseColor),
+        _density(density),
+        _starsPerFrame(starsPerFrame)
+    {
+    }
+
+    NightTwinkleEffect(const JsonObjectConst& jsonObject)
+      : EffectWithId<NightTwinkleEffect>(jsonObject),
+        _baseColor(jsonObject[PTY_COLOR].is<CRGB>() ? jsonObject[PTY_COLOR].as<CRGB>() : CRGB(0, 0, 255)),
+        _density(DensityFromJSON(jsonObject)),
+        _starsPerFrame(jsonObject[PTY_STARS_PER_FRAME].is<size_t>() ? jsonObject[PTY_STARS_PER_FRAME].as<size_t>() : kDefaultStarsPerFrame)
+    {
+    }
+
+    bool SerializeToJSON(JsonObject& jsonObject) override
+    {
+        auto jsonDoc = CreateJsonDocument();
+
+        JsonObject root = jsonDoc.to<JsonObject>();
+        LEDStripEffect::SerializeToJSON(root);
+
+        jsonDoc[PTY_COLOR] = _baseColor;
+        jsonDoc[PTY_DENSITY] = _density;
+        jsonDoc[PTY_STARS_PER_FRAME] = _starsPerFrame;
+
+        return SetIfNotOverflowed(jsonDoc, jsonObject, __PRETTY_FUNCTION__);
+    }
+
+    void Draw() override
+    {
+        Update();
+        CreateStars();
+
+        fillSolidOnAllChannels(_baseColor);
+
+        for (auto& star : _allParticles)
+        {
+            star.UpdatePosition();
+            setPixelOnAllChannels(static_cast<int>(star._iPos), _baseColor + star.ObjectColor());
+        }
+    }
 };
 
 template <typename StarType> class BlurStarEffect : public StarEffectBase<StarType, BlurStarEffect<StarType>>

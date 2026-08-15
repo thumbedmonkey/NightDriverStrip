@@ -1,3 +1,5 @@
+#pragma once
+
 
 //+--------------------------------------------------------------------------
 //
@@ -60,6 +62,8 @@
 #ifndef PatternNoiseSmearing_H
 #define PatternNoiseSmearing_H
 
+#include <array>
+
 class PatternRainbowFlag : public EffectWithId<PatternRainbowFlag>
 {
   public:
@@ -72,36 +76,41 @@ class PatternRainbowFlag : public EffectWithId<PatternRainbowFlag>
 
     void Draw() override
     {
-        g()->DimAll(10);
+        g().DimAll(10);
 
-        CRGB rainbow[7] = {CRGB::Red, CRGB::Orange, CRGB::Yellow, CRGB::Green, CRGB::Blue, CRGB::Violet};
+        static constexpr std::array<CRGB, 6> rainbow = {
+            CRGB::Red,
+            CRGB::Orange,
+            CRGB::Yellow,
+            CRGB::Green,
+            CRGB::Blue,
+            CRGB::Violet
+        };
 
-        uint8_t y = 2;
+        uint32_t y = 2;
 
-        for (uint8_t c = 0; c < 6; c++)
+        for (uint32_t c = 0; c < rainbow.size() && y < MATRIX_HEIGHT; c++)
         {
-            for (uint8_t j = 0; j < 5; j++)
+            for (uint32_t j = 0; j < 5 && y < MATRIX_HEIGHT; j++)
             {
-                for (uint16_t x = 0; x < MATRIX_WIDTH; x++)
+                for (uint32_t x = 0; x < MATRIX_WIDTH; x++)
                 {
-                    g()->leds[XY(x, y)] += rainbow[c];
+                    g().leds[XY(x, y)] += rainbow[c];
                 }
 
                 y++;
-                if (y >= MATRIX_HEIGHT)
-                    break;
             }
         }
 
         // Noise
-        g()->SetNoise(1000, 1000, 0, 4000, 4000);
-        g()->FillGetNoise();
+        g().SetNoise(1000, 1000, 0, 4000, 4000);
+        g().FillGetNoise();
 
-        g()->MoveX(8);
-        // g()->MoveFractionalNoiseY<NoiseApproach::One>(8);
+        g().MoveX(8);
+        // g().MoveFractionalNoiseY<NoiseApproach::One>(8);
 
-        g()->MoveY(3);
-        g()->MoveFractionalNoiseX<NoiseApproach::One>(4);
+        g().MoveY(3);
+        g().MoveFractionalNoiseX<NoiseApproach::MRI>(4);
     }
 };
 #endif

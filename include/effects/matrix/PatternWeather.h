@@ -1,3 +1,5 @@
+#pragma once
+
 
 //+--------------------------------------------------------------------------
 //
@@ -35,19 +37,21 @@
 #define PatternWeather_H
 
 #include <Arduino.h>
-#include <string.h>
-#include <HTTPClient.h>
-#include <UrlEncode.h>
-#include <ledstripeffect.h>
-#include <hub75gfx.h>
 #include <ArduinoJson.h>
-#include "systemcontainer.h"
+#include <algorithm>
 #include <array>
 #include <chrono>
-#include <thread>
+#include <HTTPClient.h>
 #include <map>
-#include "TJpg_Decoder.h"
+#include <mutex>
+#include <string.h>
+#include <thread>
+#include <UrlEncode.h>
+
 #include "effects.h"
+#include "array_utils.h"
+#include "systemcontainer.h"
+#include "TJpg_Decoder.h"
 #include "types.h"
 
 // Use centralized Apple5x7 font across all targets
@@ -98,27 +102,32 @@ extern const uint8_t thunderstorm_night_end[]       asm("_binary_assets_bmp_thun
 
 static constexpr auto pszDaysOfWeek = to_array( { "SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT" } );
 
-static std::map<const String, EmbeddedFile, std::less<const String>, psram_allocator<std::pair<const String, EmbeddedFile>>> weatherIcons =
+inline const std::map<const String, EmbeddedFile>& WeatherIcons()
 {
-    { "01d", EmbeddedFile(clearsky_start, clearsky_end) },
-    { "02d", EmbeddedFile(fewclouds_start, fewclouds_end) },
-    { "03d", EmbeddedFile(scatteredclouds_start, scatteredclouds_end) },
-    { "04d", EmbeddedFile(brokenclouds_start, brokenclouds_end) },
-    { "09d", EmbeddedFile(showerrain_start, showerrain_end) },
-    { "10d", EmbeddedFile(rain_start, rain_end) },
-    { "11d", EmbeddedFile(thunderstorm_start, thunderstorm_end) },
-    { "13d", EmbeddedFile(snow_start, snow_end) },
-    { "50d", EmbeddedFile(mist_start, mist_end) },
-    { "01n", EmbeddedFile(clearsky_night_start, clearsky_night_end) },
-    { "02n", EmbeddedFile(fewclouds_night_start, fewclouds_night_end) },
-    { "03n", EmbeddedFile(scatteredclouds_night_start, scatteredclouds_night_end) },
-    { "04n", EmbeddedFile(brokenclouds_night_start, brokenclouds_night_end) },
-    { "09n", EmbeddedFile(showerrain_night_start, showerrain_night_end) },
-    { "10n", EmbeddedFile(rain_night_start, rain_night_end) },
-    { "11n", EmbeddedFile(thunderstorm_night_start, thunderstorm_night_end) },
-    { "13n", EmbeddedFile(snow_night_start, snow_night_end) },
-    { "50n", EmbeddedFile(mist_night_start, mist_night_end) }
-};
+    static const std::map<const String, EmbeddedFile> weatherIcons =
+    {
+        { "01d", EmbeddedFile(clearsky_start, clearsky_end) },
+        { "02d", EmbeddedFile(fewclouds_start, fewclouds_end) },
+        { "03d", EmbeddedFile(scatteredclouds_start, scatteredclouds_end) },
+        { "04d", EmbeddedFile(brokenclouds_start, brokenclouds_end) },
+        { "09d", EmbeddedFile(showerrain_start, showerrain_end) },
+        { "10d", EmbeddedFile(rain_start, rain_end) },
+        { "11d", EmbeddedFile(thunderstorm_start, thunderstorm_end) },
+        { "13d", EmbeddedFile(snow_start, snow_end) },
+        { "50d", EmbeddedFile(mist_start, mist_end) },
+        { "01n", EmbeddedFile(clearsky_night_start, clearsky_night_end) },
+        { "02n", EmbeddedFile(fewclouds_night_start, fewclouds_night_end) },
+        { "03n", EmbeddedFile(scatteredclouds_night_start, scatteredclouds_night_end) },
+        { "04n", EmbeddedFile(brokenclouds_night_start, brokenclouds_night_end) },
+        { "09n", EmbeddedFile(showerrain_night_start, showerrain_night_end) },
+        { "10n", EmbeddedFile(rain_night_start, rain_night_end) },
+        { "11n", EmbeddedFile(thunderstorm_night_start, thunderstorm_night_end) },
+        { "13n", EmbeddedFile(snow_night_start, snow_night_end) },
+        { "50n", EmbeddedFile(mist_night_start, mist_night_end) }
+    };
+
+    return weatherIcons;
+}
 
 /**
  * @brief This class implements the Weather Data effect
@@ -145,6 +154,10 @@ class PatternWeather : public EffectWithId<PatternWeather>
     bool   dataReady          = false;
     size_t readerIndex        = SIZE_MAX;
     system_clock::time_point latestUpdate = system_clock::from_time_t(0);
+    mutable std::mutex weatherDataMutex;
+
+    static constexpr int WeatherFontHeight = 7;
+    static constexpr int WeatherFontWidth  = 5;
 
     /**
      * @brief Should this effect show its title.
@@ -208,7 +221,7 @@ class PatternWeather : public EffectWithId<PatternWeather>
      */
     static inline float KelvinToLocal(float K)
     {
-        if (g_ptrSystem->DeviceConfig().UseCelsius())
+        if (g_ptrSystem->GetDeviceConfig().UseCelsius())
             return KelvinToCelsius(K);
         else
             return KelvinToFarenheit(K);
@@ -225,19 +238,22 @@ class PatternWeather : public EffectWithId<PatternWeather>
         HTTPClient http;
         String url;
 
-        if (!HasLocationChanged())
-            return false;
+        const String configLocation = g_ptrSystem->GetDeviceConfig().GetLocation();
+        const String configCountryCode = g_ptrSystem->GetDeviceConfig().GetCountryCode();
+        const bool configLocationIsZip = g_ptrSystem->GetDeviceConfig().IsLocationZip();
 
-        const String& configLocation = g_ptrSystem->DeviceConfig().GetLocation();
-        const String& configCountryCode = g_ptrSystem->DeviceConfig().GetCountryCode();
-        const bool configLocationIsZip = g_ptrSystem->DeviceConfig().IsLocationZip();
+        {
+            std::lock_guard guard(weatherDataMutex);
+            if (configLocation == strLocation && configCountryCode == strCountryCode)
+                return false;
+        }
 
         if (configLocationIsZip)
             url = "http://api.openweathermap.org/geo/1.0/zip"
-                "?zip=" + urlEncode(configLocation) + "," + urlEncode(configCountryCode) + "&appid=" + urlEncode(g_ptrSystem->DeviceConfig().GetOpenWeatherAPIKey());
+                "?zip=" + urlEncode(configLocation) + "," + urlEncode(configCountryCode) + "&appid=" + urlEncode(g_ptrSystem->GetDeviceConfig().GetOpenWeatherAPIKey());
         else
             url = "http://api.openweathermap.org/geo/1.0/direct"
-                "?q=" + urlEncode(configLocation) + "," + urlEncode(configCountryCode) + "&limit=1&appid=" + urlEncode(g_ptrSystem->DeviceConfig().GetOpenWeatherAPIKey());
+                "?q=" + urlEncode(configLocation) + "," + urlEncode(configCountryCode) + "&limit=1&appid=" + urlEncode(g_ptrSystem->GetDeviceConfig().GetOpenWeatherAPIKey());
 
         http.begin(url);
         int httpResponseCode = http.GET();
@@ -253,13 +269,18 @@ class PatternWeather : public EffectWithId<PatternWeather>
         deserializeJson(doc, http.getString());
         JsonObject coordinates = configLocationIsZip ? doc.as<JsonObject>() : doc[0].as<JsonObject>();
 
-        strLatitude = coordinates["lat"].as<String>();
-        strLongitude = coordinates["lon"].as<String>();
+        String newLatitude = coordinates["lat"].as<String>();
+        String newLongitude = coordinates["lon"].as<String>();
 
         http.end();
 
-        strLocation = configLocation;
-        strCountryCode = configCountryCode;
+        {
+            std::lock_guard guard(weatherDataMutex);
+            strLatitude = newLatitude;
+            strLongitude = newLongitude;
+            strLocation = configLocation;
+            strCountryCode = configCountryCode;
+        }
 
         return true;
     }
@@ -270,15 +291,22 @@ class PatternWeather : public EffectWithId<PatternWeather>
      * Tommorow's expected high and low temperatures,
      * and an icon for tomorrow's weather forcast
      *
-     * @param highTemp address to store the high temperature
-     * @param lowTemp address to store the low temperature
      * @return bool - true if valid weather data retrieved
      */
-    bool getTomorrowTemps(float& highTemp, float& lowTemp)
+    bool getTomorrowTemps()
     {
         HTTPClient http;
+        String latitude;
+        String longitude;
+
+        {
+            std::lock_guard guard(weatherDataMutex);
+            latitude = strLatitude;
+            longitude = strLongitude;
+        }
+
         String url = "http://api.openweathermap.org/data/2.5/forecast"
-            "?lat=" + strLatitude + "&lon=" + strLongitude + "&cnt=16&appid=" + urlEncode(g_ptrSystem->DeviceConfig().GetOpenWeatherAPIKey());
+            "?lat=" + latitude + "&lon=" + longitude + "&cnt=16&appid=" + urlEncode(g_ptrSystem->GetDeviceConfig().GetOpenWeatherAPIKey());
         http.begin(url);
         int httpResponseCode = http.GET();
 
@@ -300,7 +328,7 @@ class PatternWeather : public EffectWithId<PatternWeather>
             float dailyMaximum = 0.0;
             int slot = 0;
 
-            iconTomorrow = "";
+            String newIconTomorrow = "";
 
             // Look for the temperature data for tomorrow
             for (size_t i = 0; i < list.size(); ++i)
@@ -330,14 +358,21 @@ class PatternWeather : public EffectWithId<PatternWeather>
 
                     // Use the noon slot for the icon
                     if (slot == 4)
-                        iconTomorrow = entry["weather"][0]["icon"].as<String>();
+                        newIconTomorrow = entry["weather"][0]["icon"].as<String>();
                 }
             }
 
-            highTemp        = KelvinToLocal(dailyMaximum);
-            lowTemp         = KelvinToLocal(dailyMinimum);
+            float newHighTomorrow = KelvinToLocal(dailyMaximum);
+            float newLoTomorrow = KelvinToLocal(dailyMinimum);
 
-            debugI("Got tomorrow's temps: Lo %d, Hi %d, Icon %s", (int)lowTemp, (int)highTemp, iconTomorrow.c_str());
+            {
+                std::lock_guard guard(weatherDataMutex);
+                highTomorrow = newHighTomorrow;
+                loTomorrow = newLoTomorrow;
+                iconTomorrow = newIconTomorrow;
+            }
+
+            debugI("Got tomorrow's temps: Lo %d, Hi %d, Icon %s", (int)newLoTomorrow, (int)newHighTomorrow, newIconTomorrow.c_str());
 
             http.end();
             return true;
@@ -361,31 +396,50 @@ class PatternWeather : public EffectWithId<PatternWeather>
     bool getWeatherData()
     {
         HTTPClient http;
+        String latitude;
+        String longitude;
+
+        {
+            std::lock_guard guard(weatherDataMutex);
+            latitude = strLatitude;
+            longitude = strLongitude;
+        }
 
         String url = "http://api.openweathermap.org/data/2.5/weather"
-            "?lat=" + strLatitude + "&lon=" + strLongitude + "&appid=" + urlEncode(g_ptrSystem->DeviceConfig().GetOpenWeatherAPIKey());
+            "?lat=" + latitude + "&lon=" + longitude + "&appid=" + urlEncode(g_ptrSystem->GetDeviceConfig().GetOpenWeatherAPIKey());
         http.begin(url);
         int httpResponseCode = http.GET();
         if (httpResponseCode > 0)
         {
-            iconToday = "";
             auto jsonDoc = CreateJsonDocument();
             deserializeJson(jsonDoc, http.getString());
 
             // Once we have a non-zero temp we can start displaying things
-            if (0 < jsonDoc["main"]["temp"])
-                dataReady = true;
+            bool newDataReady = 0 < jsonDoc["main"]["temp"];
 
-            temperature = KelvinToLocal(jsonDoc["main"]["temp"]);
-            highToday   = KelvinToLocal(jsonDoc["main"]["temp_max"]);
-            loToday     = KelvinToLocal(jsonDoc["main"]["temp_min"]);
+            float newTemperature = KelvinToLocal(jsonDoc["main"]["temp"]);
+            float newHighToday = KelvinToLocal(jsonDoc["main"]["temp_max"]);
+            float newLoToday = KelvinToLocal(jsonDoc["main"]["temp_min"]);
 
-            iconToday = jsonDoc["weather"][0]["icon"].as<String>();
-            debugI("Got today's temps: Now %d Lo %d, Hi %d, Icon %s", (int)temperature, (int)loToday, (int)highToday, iconToday.c_str());
+            String newIconToday = jsonDoc["weather"][0]["icon"].as<String>();
+            String newLocationName;
 
             const char * pszName = jsonDoc["name"];
             if (pszName)
-                strLocationName = pszName;
+                newLocationName = pszName;
+
+            {
+                std::lock_guard guard(weatherDataMutex);
+                dataReady = newDataReady;
+                temperature = newTemperature;
+                highToday = newHighToday;
+                loToday = newLoToday;
+                iconToday = newIconToday;
+                if (!newLocationName.isEmpty())
+                    strLocationName = newLocationName;
+            }
+
+            debugI("Got today's temps: Now %d Lo %d, Hi %d, Icon %s", (int)newTemperature, (int)newLoToday, (int)newHighToday, newIconToday.c_str());
 
             http.end();
             return true;
@@ -405,19 +459,19 @@ class PatternWeather : public EffectWithId<PatternWeather>
      */
     void UpdateWeather()
     {
-        while(!WiFi.isConnected())
+        while (!nd_network::IsWiFiConnected())
         {
             debugW("Delaying Weather update, waiting for WiFi...");
             vTaskDelay(pdMS_TO_TICKS(WEATHER_CHECK_WIFI_WAIT));
         }
 
         // Only try to update if we have an API Key
-        if (!g_ptrSystem->DeviceConfig().GetOpenWeatherAPIKey().isEmpty())
+        if (!g_ptrSystem->GetDeviceConfig().GetOpenWeatherAPIKey().isEmpty())
         {
             updateCoordinates();
 
             if (getWeatherData())
-                getTomorrowTemps(highTomorrow, loTomorrow);
+                getTomorrowTemps();
         }
     }
 
@@ -429,10 +483,48 @@ class PatternWeather : public EffectWithId<PatternWeather>
      */
     bool HasLocationChanged()
     {
-        bool locationChanged = g_ptrSystem->DeviceConfig().GetLocation() != strLocation;
-        bool countryChanged = g_ptrSystem->DeviceConfig().GetCountryCode() != strCountryCode;
+        const String configLocation = g_ptrSystem->GetDeviceConfig().GetLocation();
+        const String configCountryCode = g_ptrSystem->GetDeviceConfig().GetCountryCode();
 
-        return locationChanged || countryChanged;
+        std::lock_guard guard(weatherDataMutex);
+        return configLocation != strLocation || configCountryCode != strCountryCode;
+    }
+
+    String GetLocationDisplayText(const String& displayLocationName, const String& displayLocation, bool hasWeatherApiKey) const
+    {
+        if (!hasWeatherApiKey)
+            return "No API Key";
+
+        String showLocation = displayLocation;
+        showLocation.toUpperCase();
+        return displayLocationName.isEmpty() ? showLocation : displayLocationName;
+    }
+
+    static String GetTemperatureDisplayText(float displayTemperature, bool displayDataReady)
+    {
+        if (!displayDataReady)
+            return "--";
+
+        return String((int)displayTemperature);
+    }
+
+    void DrawCompactWeather(int screenHeight,
+                            const String& locationText,
+                            const String& temperatureText,
+                            bool showLocationLine)
+    {
+        if (showLocationLine)
+        {
+            const int topLineHeight = screenHeight / 2;
+            g().DrawTextInBand(locationText, 0, topLineHeight, WHITE16);
+            g().DrawTextInBand(temperatureText, topLineHeight, screenHeight - topLineHeight, g().to16bit(CRGB(192,192,192)));
+            return;
+        }
+
+        g().DrawTextInBand(temperatureText.isEmpty() ? locationText : temperatureText,
+                           0,
+                           screenHeight,
+                           g().to16bit(CRGB(192,192,192)));
     }
 
 public:
@@ -456,7 +548,7 @@ public:
      */
     ~PatternWeather()
     {
-        g_ptrSystem->NetworkReader().CancelReader(readerIndex);
+        g_ptrSystem->GetNetworkReader().CancelReader(readerIndex);
     }
 
     /**
@@ -471,7 +563,7 @@ public:
             return false;
 
         // Register a Network Reader task with no interval.  Will manually flag in Draw()
-        readerIndex = g_ptrSystem->NetworkReader().RegisterReader([this] { UpdateWeather(); });
+        readerIndex = g_ptrSystem->GetNetworkReader().RegisterReader([this] { UpdateWeather(); });
 
         return true;
     }
@@ -484,13 +576,13 @@ public:
      */
     void Draw() override
     {
-        const int fontHeight = 7;
-        const int fontWidth  = 5;
-        const int xHalf      = MATRIX_WIDTH / 2 - 1;
+        const int screenWidth  = static_cast<int>(g().GetMatrixWidth());
+        const int screenHeight = static_cast<int>(g().GetMatrixHeight());
+        const int xHalf        = screenWidth / 2 - 1;
 
-        g()->fillScreen(BLACK16);
-        g()->fillRect(0, 0, MATRIX_WIDTH, 9, g()->to16bit(CRGB(0,0,128)));
-        g()->setFont(&Apple5x7);
+        g().fillScreen(BLACK16);
+        g().setFont(&Apple5x7);
+        g().setTextWrap(false);
 
         auto now = system_clock::now();
 
@@ -504,56 +596,89 @@ public:
 
             debugI("Triggering thread to check weather now...");
             // Trigger the weather reader.
-            g_ptrSystem->NetworkReader().FlagReader(readerIndex);
+            g_ptrSystem->GetNetworkReader().FlagReader(readerIndex);
         }
 
+        // Hold the weather data lock for the rest of the frame. The writer
+        // (network reader task) only takes this lock for the few microseconds
+        // it takes to assign these fields after the HTTP fetch completes, so
+        // blocking here is effectively never observable and never approaches
+        // anything the WDT would care about. We do NOT take any other lock
+        // (render / effect manager) while holding this one, which keeps the
+        // ordering one-way and inversion-proof.
+        std::lock_guard guard(weatherDataMutex);
+
+        const String& displayLocationName = strLocationName;
+        const String& displayLocation     = strLocation;
+        const String& displayIconToday    = iconToday;
+        const String& displayIconTomorrow = iconTomorrow;
+        const float   displayTemperature  = temperature;
+        const float   displayHighToday    = highToday;
+        const float   displayLoToday      = loToday;
+        const float   displayHighTomorrow = highTomorrow;
+        const float   displayLoTomorrow   = loTomorrow;
+        const bool    displayDataReady    = dataReady;
+        const bool    hasWeatherApiKey    = !g_ptrSystem->GetDeviceConfig().GetOpenWeatherAPIKey().isEmpty();
+        const String  locationText        = GetLocationDisplayText(displayLocationName, displayLocation, hasWeatherApiKey);
+        const String  temperatureText     = hasWeatherApiKey ? GetTemperatureDisplayText(displayTemperature, displayDataReady) : "";
+
+        if (screenHeight < 16)
+        {
+            DrawCompactWeather(screenHeight, locationText, temperatureText, false);
+            return;
+        }
+
+        if (screenHeight < 32)
+        {
+            DrawCompactWeather(screenHeight, locationText, temperatureText, true);
+            return;
+        }
+
+        g().fillRect(0, 0, screenWidth, 9, g().to16bit(CRGB(0,0,128)));
+
         // Draw the graphics
-        auto iconEntry = weatherIcons.find(iconToday);
+        const auto& weatherIcons = WeatherIcons();
+        auto iconEntry = weatherIcons.find(displayIconToday);
         if (iconEntry != weatherIcons.end())
         {
             auto icon = iconEntry->second;
             if (JDR_OK != TJpgDec.drawJpg(0, 10, icon.contents, icon.length))        // Draw the image
-                debugW("Could not display icon %s", iconToday.c_str());
+                debugW("Could not display icon %s", displayIconToday.c_str());
         }
 
-        iconEntry = weatherIcons.find(iconTomorrow);
+        iconEntry = weatherIcons.find(displayIconTomorrow);
         if (iconEntry != weatherIcons.end())
         {
             auto icon = iconEntry->second;
             if (JDR_OK != TJpgDec.drawJpg(xHalf+1, 10, icon.contents, icon.length))        // Draw the image
-                debugW("Could not display icon %s", iconTomorrow.c_str());
+                debugW("Could not display icon %s", displayIconTomorrow.c_str());
         }
 
         // Print the town/city name
         int x = 0;
-        int y = fontHeight + 1;
-        g()->setCursor(x, y);
-        g()->setTextColor(WHITE16);
-        String showLocation = strLocation;
-        showLocation.toUpperCase();
-        if (g_ptrSystem->DeviceConfig().GetOpenWeatherAPIKey().isEmpty())
-            g()->print("No API Key");
-        else
-            g()->print((strLocationName.isEmpty() ? showLocation : strLocationName).substring(0, (MATRIX_WIDTH - 2 * fontWidth)/fontWidth));
+        int y = WeatherFontHeight + 1;
+        g().setCursor(x, y);
+        g().setTextColor(WHITE16);
+        g().print(g().FitTextToWidth(locationText, screenWidth - 2 * WeatherFontWidth));
 
         // Display the temperature, right-justified
 
-        if (dataReady)
+        if (displayDataReady)
         {
-            String strTemp((int)temperature);
-            x = MATRIX_WIDTH - fontWidth * strTemp.length();
-            g()->setCursor(x, y);
-            g()->setTextColor(g()->to16bit(CRGB(192,192,192)));
-            g()->print(strTemp);
+            String strTemp((int)displayTemperature);
+            x = std::max(0, screenWidth - WeatherFontWidth * static_cast<int>(strTemp.length()));
+            g().setCursor(x, y);
+            g().setTextColor(g().to16bit(CRGB(192,192,192)));
+            g().print(strTemp);
         }
 
         // Draw the separator lines
 
         y+=1;
 
-        g()->drawLine(0, y, MATRIX_WIDTH-1, y, CRGB(0,0,128));
-        g()->drawLine(xHalf, y, xHalf, MATRIX_HEIGHT-1, CRGB(0,0,128));
-        y+=2 + fontHeight;
+        g().drawLine(0, y, screenWidth-1, y, CRGB(0,0,128));
+        g().drawLine(xHalf, y, xHalf, screenHeight-1, CRGB(0,0,128));
+        y+=2 + WeatherFontHeight;
 
         // Figure out which day of the week it is
 
@@ -563,43 +688,43 @@ public:
         const char * pszTomorrow = pszDaysOfWeek[ (todayTime->tm_wday + 1) % 7 ];
 
         // Draw the day of the week and tomorrow's day as well
-        g()->setTextColor(WHITE16);
-        g()->setCursor(0, MATRIX_HEIGHT);
-        g()->print(pszToday);
-        g()->setCursor(xHalf+2, MATRIX_HEIGHT);
-        g()->print(pszTomorrow);
+        g().setTextColor(WHITE16);
+        g().setCursor(0, screenHeight);
+        g().print(pszToday);
+        g().setCursor(xHalf+2, screenHeight);
+        g().print(pszTomorrow);
 
         // Draw the temperature in lighter white
 
-        if (dataReady)
+        if (displayDataReady)
         {
-            g()->setTextColor(g()->to16bit(CRGB(192,192,192)));
-            String strHi((int) highToday);
-            String strLo((int) loToday);
+            g().setTextColor(g().to16bit(CRGB(192,192,192)));
+            String strHi((int) displayHighToday);
+            String strLo((int) displayLoToday);
 
             // Draw today's HI and LO temperatures
 
-            x = xHalf - fontWidth * strHi.length();
-            y = MATRIX_HEIGHT - fontHeight;
-            g()->setCursor(x,y);
-            g()->print(strHi);
-            x = xHalf - fontWidth * strLo.length();
-            y+= fontHeight;
-            g()->setCursor(x,y);
-            g()->print(strLo);
+            x = std::max(0, xHalf - WeatherFontWidth * static_cast<int>(strHi.length()));
+            y = screenHeight - WeatherFontHeight;
+            g().setCursor(x,y);
+            g().print(strHi);
+            x = std::max(0, xHalf - WeatherFontWidth * static_cast<int>(strLo.length()));
+            y+= WeatherFontHeight;
+            g().setCursor(x,y);
+            g().print(strLo);
 
             // Draw tomorrow's HI and LO temperatures
 
-            strHi = String((int)highTomorrow);
-            strLo = String((int)loTomorrow);
-            x = MATRIX_WIDTH - fontWidth * strHi.length();
-            y = MATRIX_HEIGHT - fontHeight;
-            g()->setCursor(x,y);
-            g()->print(strHi);
-            x = MATRIX_WIDTH - fontWidth * strLo.length();
-            y+= fontHeight;
-            g()->setCursor(x,y);
-            g()->print(strLo);
+            strHi = String((int)displayHighTomorrow);
+            strLo = String((int)displayLoTomorrow);
+            x = std::max(0, screenWidth - WeatherFontWidth * static_cast<int>(strHi.length()));
+            y = screenHeight - WeatherFontHeight;
+            g().setCursor(x,y);
+            g().print(strHi);
+            x = std::max(0, screenWidth - WeatherFontWidth * static_cast<int>(strLo.length()));
+            y+= WeatherFontHeight;
+            g().setCursor(x,y);
+            g().print(strLo);
         }
     }
 };

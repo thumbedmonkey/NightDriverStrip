@@ -1,3 +1,5 @@
+#pragma once
+
 
 //+--------------------------------------------------------------------------
 //
@@ -33,7 +35,11 @@
 #ifndef PatternSub_H
 #define PatternSub_H
 
-#include <UrlEncode.h>
+
+#if ENABLE_WIFI
+
+#include <HTTPClient.h>
+
 #include "systemcontainer.h"
 
 extern const GFXfont Apple5x7 PROGMEM;
@@ -67,6 +73,21 @@ class PatternSubscribers : public EffectWithId<PatternSubscribers>
 
     time_t latestUpdate                     = 0;
 
+    void DrawCompactSubscribers(int screenHeight)
+    {
+        const int topLineHeight = screenHeight / 2;
+        const String subscriberText = str_sprintf("%ld", subscribers);
+
+        g().DrawTextInBand(youtubeChannelName.isEmpty() ? "Subscribers" : youtubeChannelName,
+                           0,
+                           topLineHeight,
+                           CRGB::White);
+        g().DrawTextInBand(subscriberText,
+                           topLineHeight,
+                           screenHeight - topLineHeight,
+                           borderColor);
+    }
+
     void SubscriberReader()
     {
         unsigned long msSinceLastCheck = millis() - msLastCheck;
@@ -81,7 +102,7 @@ class PatternSubscribers : public EffectWithId<PatternSubscribers>
 
     void UpdateSubscribers()
     {
-        if (!WiFi.isConnected())
+        if (!nd_network::IsWiFiConnected())
         {
             debugW("Skipping Subscriber update, waiting for WiFi...");
             return;
@@ -141,22 +162,32 @@ class PatternSubscribers : public EffectWithId<PatternSubscribers>
         // Lazily load this class' SettingSpec instances if they haven't been already
         if (mySettingSpecs.size() == 0)
         {
-            mySettingSpecs.emplace_back(
-                NAME_OF(youtubeChannelGuid),
-                "YouTube channel GUID",
-                "The <a href=\"http://tools.tastethecode.com/youtube-sight\">YouTube Sight</a> GUID of the channel for which "
-                "the effect should show subscriber information.",
-                SettingSpec::SettingType::String
-            );
-            mySettingSpecs.emplace_back(NAME_OF(backgroundColor), "Background Color",
-                                        "Color for the background",
-                                        SettingSpec::SettingType::Color);
-            mySettingSpecs.emplace_back(NAME_OF(borderColor), "Border Color",
-                                        "Color for the border around the edge", SettingSpec::SettingType::Color);
-            mySettingSpecs.emplace_back(NAME_OF(youtubeChannelName), "YouTube channel name",
-                                         "The name of the channel for which the effect should show subscriber information.",
-                                         SettingSpec::SettingType::String)
-                                         .EmptyAllowed = true;
+            mySettingSpecs.push_back(SettingSpec::Validate(SettingSpec{
+                .Name         = NAME_OF(youtubeChannelGuid),
+                .FriendlyName = "YouTube channel GUID",
+                .Description  = "The <a href=\"http://tools.tastethecode.com/youtube-sight\">YouTube Sight</a> GUID of the channel for which "
+                                "the effect should show subscriber information.",
+                .Type         = SettingSpec::SettingType::String
+            }));
+            mySettingSpecs.push_back(SettingSpec::Validate(SettingSpec{
+                .Name         = NAME_OF(backgroundColor),
+                .FriendlyName = "Background Color",
+                .Description  = "Color for the background",
+                .Type         = SettingSpec::SettingType::Color
+            }));
+            mySettingSpecs.push_back(SettingSpec::Validate(SettingSpec{
+                .Name         = NAME_OF(borderColor),
+                .FriendlyName = "Border Color",
+                .Description  = "Color for the border around the edge",
+                .Type         = SettingSpec::SettingType::Color
+            }));
+            mySettingSpecs.push_back(SettingSpec::Validate(SettingSpec{
+                .Name         = NAME_OF(youtubeChannelName),
+                .FriendlyName = "YouTube channel name",
+                .Description  = "The name of the channel for which the effect should show subscriber information.",
+                .Type         = SettingSpec::SettingType::String,
+                .EmptyAllowed = true
+            }));
         }
 
         return &mySettingSpecs;
@@ -180,7 +211,7 @@ class PatternSubscribers : public EffectWithId<PatternSubscribers>
 
     ~PatternSubscribers()
     {
-        g_ptrSystem->NetworkReader().CancelReader(readerIndex);
+        g_ptrSystem->GetNetworkReader().CancelReader(readerIndex);
     }
 
     bool SerializeToJSON(JsonObject& jsonObject) override
@@ -208,25 +239,36 @@ class PatternSubscribers : public EffectWithId<PatternSubscribers>
         if (!LEDStripEffect::Init(gfx))
             return false;
 
-        readerIndex = g_ptrSystem->NetworkReader().RegisterReader([this] { SubscriberReader(); }, SUB_READER_INTERVAL, true);
+        readerIndex = g_ptrSystem->GetNetworkReader().RegisterReader([this] { SubscriberReader(); }, SUB_READER_INTERVAL, true);
 
         return true;
     }
 
     void Draw() override
     {
-        g()->Clear(backgroundColor);
-
-        // Draw a border around the edge of the panel
-        g()->drawRect(0, 1, MATRIX_WIDTH - 1, MATRIX_HEIGHT - 2, g()->to16bit(borderColor));
+        const int screenWidth = static_cast<int>(g().GetMatrixWidth());
+        const int screenHeight = static_cast<int>(g().GetMatrixHeight());
 
         // Use the centralized Apple5x7 Adafruit font
-        g()->setFont(&Apple5x7);
+        g().setFont(&Apple5x7);
+        g().setTextWrap(false);
+
+        if (screenHeight < 32)
+        {
+            g().fillScreen(BLACK16);
+            DrawCompactSubscribers(screenHeight);
+            return;
+        }
+
+        g().Clear(backgroundColor);
+
+        // Draw a border around the edge of the panel
+        g().drawRect(0, 1, screenWidth - 1, screenHeight - 2, g().to16bit(borderColor));
 
         // Draw the channel name
-        g()->setTextColor(g()->to16bit(CRGB::White));
-        g()->setCursor(2, 10);
-        g()->print(youtubeChannelName.c_str());
+        g().setTextColor(g().to16bit(CRGB::White));
+        g().setCursor(2, 10);
+        g().print(youtubeChannelName.c_str());
 
         // Start in the middle of the panel and then back up a half a row to center vertically,
         // then back up left one half a char for every 10s digit in the subscriber count.  This
@@ -239,23 +281,23 @@ class PatternSubscribers : public EffectWithId<PatternSubscribers>
         // Use getTextBounds to get the actual dimensions of the subscriber text
         int16_t x1, y1;
         uint16_t textWidth, textHeight;
-        g()->getTextBounds(pszText, 0, 0, &x1, &y1, &textWidth, &textHeight);
+        g().getTextBounds(pszText, 0, 0, &x1, &y1, &textWidth, &textHeight);
 
         // Center the text horizontally and vertically on the screen
         // Note: y1 is typically negative (above baseline), so we need to account for that
-        int x = (MATRIX_WIDTH - textWidth) / 2;
-        int y = (MATRIX_HEIGHT / 2) - (textHeight / 2) - y1;  // Properly center vertically
+        int x = (screenWidth - textWidth) / 2;
+        int y = (screenHeight / 2) - (textHeight / 2) - y1;  // Properly center vertically
 
         // Draw shadow effect by printing in black at offset positions, then white on top
-        g()->setTextColor(g()->to16bit(CRGB::Black));
-        g()->setCursor(x-1, y);   g()->print(pszText);
-        g()->setCursor(x+1, y);   g()->print(pszText);
-        g()->setCursor(x, y-1);   g()->print(pszText);
-        g()->setCursor(x, y+1);   g()->print(pszText);
+        g().setTextColor(g().to16bit(CRGB::Black));
+        g().setCursor(x-1, y);   g().print(pszText);
+        g().setCursor(x+1, y);   g().print(pszText);
+        g().setCursor(x, y-1);   g().print(pszText);
+        g().setCursor(x, y+1);   g().print(pszText);
 
-        g()->setTextColor(g()->to16bit(CRGB::White));
-        g()->setCursor(x, y);
-        g()->print(pszText);
+        g().setTextColor(g().to16bit(CRGB::White));
+        g().setCursor(x, y);
+        g().print(pszText);
     }
 
     // Extension override to serialize our settings on top of those from LEDStripEffect
@@ -277,13 +319,19 @@ class PatternSubscribers : public EffectWithId<PatternSubscribers>
     // Extension override to accept our settings on top of those known by LEDStripEffect
     bool SetSetting(const String& name, const String& value) override
     {
-        RETURN_IF_SET(name, NAME_OF(youtubeChannelGuid), youtubeChannelGuid, value);
-        RETURN_IF_SET(name, NAME_OF(youtubeChannelName), youtubeChannelName, value);
-        RETURN_IF_SET(name, NAME_OF(backgroundColor), backgroundColor, value);
-        RETURN_IF_SET(name, NAME_OF(borderColor), borderColor, value);
+        if (FieldAccess::AssignIfSelected(name, NAME_OF(youtubeChannelGuid), youtubeChannelGuid, value))
+            return true;
+        if (FieldAccess::AssignIfSelected(name, NAME_OF(youtubeChannelName), youtubeChannelName, value))
+            return true;
+        if (FieldAccess::AssignIfSelected(name, NAME_OF(backgroundColor), backgroundColor, value))
+            return true;
+        if (FieldAccess::AssignIfSelected(name, NAME_OF(borderColor), borderColor, value))
+            return true;
 
         return LEDStripEffect::SetSetting(name, value);
     }
 };
+
+#endif // ENABLE_WIFI
 
 #endif

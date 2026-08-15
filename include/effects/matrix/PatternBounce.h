@@ -1,3 +1,5 @@
+#pragma once
+
 //+--------------------------------------------------------------------------
 //
 // File:        PatternSpiro.h
@@ -54,8 +56,8 @@
 #ifndef PatternBounce_H
 #define PatternBounce_H
 
-#include "Vector.h"
 #include "Boid.h"
+#include "Vector.h"
 #include "ledstripeffect.h"
 
 #if MATRIX_HEIGHT > 1
@@ -105,7 +107,7 @@ public:
             boid.colorIndex = colorWidth * i;
             boid.maxforce = 10;
             boid.maxspeed = 10;
-            g()->_boids[i] = boid;
+            g()._boids[i] = boid;
         }
     }
 
@@ -114,27 +116,31 @@ public:
         // dim all pixels on the display
 
         // Blue columns only, and skip the first row of each column if the VU meter is being shown so we don't blend it onto ourselves
-        g()->blurColumns(g()->leds, MATRIX_WIDTH, MATRIX_HEIGHT, g_ptrSystem->EffectManager().IsVUVisible() ? 1 : 0, 200);
-        g()->DimAll(250);
+        g().blurColumns(g().leds, MATRIX_WIDTH, MATRIX_HEIGHT, g_ptrSystem->GetEffectManager().IsVUVisible() ? 1 : 0, 200);
+        g().DimAll(250);
 
         auto totalVelocity = 0.0;
         for (int i = 0; i < count; i++)
         {
-            Boid boid = g()->_boids[i];
+            Boid boid = g()._boids[i];
             boid.applyForce(gravity);
             boid.update();
             totalVelocity += abs(boid.velocity.y);
 
-            if (g()->isValidPixel(boid.location.x, boid.location.y))
-                g()->setPixel(boid.location.x, boid.location.y, g()->ColorFromCurrentPalette(boid.colorIndex));
+            if (boid.location.x < 0) boid.location.x = 0;
+            if (boid.location.x >= MATRIX_WIDTH) boid.location.x = MATRIX_WIDTH - 1;
 
-            if (boid.location.y >= MATRIX_HEIGHT - 1)
-            {
+            if (boid.location.y < 0) {
+                boid.location.y = 0;
+                boid.velocity.y *= -1.0;
+            } else if (boid.location.y >= MATRIX_HEIGHT - 1) {
                 boid.location.y = MATRIX_HEIGHT - 1;
                 boid.velocity.y *= -1.0;
             }
 
-            g()->_boids[i] = boid;
+            g().setPixel((int)boid.location.x, (int)boid.location.y, g().ColorFromCurrentPalette(boid.colorIndex));
+
+            g()._boids[i] = boid;
         }
 
         // If the combined velocity of all the boids is less than 1.0, restart the animation.
